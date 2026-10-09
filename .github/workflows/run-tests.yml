@@ -127,6 +127,7 @@ jobs:
           - split-table-resume
           - orphaned-target-backend
           - orphaned-target-ddl
+          - cdc-receive-reconnect-dying-source
           - cdc-receive-drain-error
           - cdc-low-level
           - cdc-test-decoding
