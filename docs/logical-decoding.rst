@@ -93,7 +93,10 @@ position the server must retain — is derived from ``confirmed_flush_lsn`` and
 determines how far back WAL segments can be recycled.  On reconnect, WAL
 streaming resumes from the greater of the client's requested start position and
 ``confirmed_flush_lsn``, so whatever the client last reported as flushed
-becomes the effective replay starting point.
+becomes the effective replay starting point.  pgcopydb sends a status update
+every 10 seconds, or every half of the source ``wal_sender_timeout`` when that
+is shorter, because a receive that is slow to write its spool reads the
+walsender's keepalive requests late.
 
 pgcopydb reports as the flush LSN the position up to which receive has
 committed and synced messages to ``output.db``, not what the apply process

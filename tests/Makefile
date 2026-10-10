@@ -121,6 +121,9 @@ cdc-filtering-pgoutput: build
 cdc-receive-reconnect-dying-source: build
 	$(MAKE) -C $@
 
+cdc-receive-status-interval: build
+	$(MAKE) -C $@
+
 follow-pgoutput: build
 	$(MAKE) -C $@
 
@@ -205,7 +208,7 @@ clean-images:
 .PHONY: cdc-endpos-in-multi-wal-txn cdc-file-rotation cdc-file-rotation-live cdc-concurrent-backlog cdc-copy-multi-insert cdc-origin-abort
 .PHONY: defer-validate-fks follow-defer-validate-fks resume-after-failure follow-catalog-lock-race
 .PHONY: cdc-pgoutput cdc-filtering-pgoutput follow-pgoutput follow-filtering
-.PHONY: follow-wal2json follow-9.6 split-table-resume orphaned-target-backend orphaned-target-ddl cdc-receive-reconnect-dying-source cdc-receive-drain-error
+.PHONY: follow-wal2json follow-9.6 split-table-resume orphaned-target-backend orphaned-target-ddl cdc-receive-status-interval cdc-receive-reconnect-dying-source cdc-receive-drain-error
 .PHONY: follow-endpos-tail follow-endpos-quiet-tail follow-ddl-message-stall
 .PHONY: follow-restart follow-restart-rotation
 .PHONY: cdc-interleaved-commits cdc-commit-order-resume
