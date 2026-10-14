@@ -125,6 +125,7 @@ jobs:
           - cdc-matview
           - cdc-replica-identity-index
           - cdc-file-rotation
+          - cdc-file-rotation-live
           - cdc-pgoutput
           - cdc-filtering-pgoutput
           - follow-wal2json

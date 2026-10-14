@@ -9,7 +9,7 @@ all: pagila pagila-multi-steps blobs unit filtering extensions \
 	 partitioned-target all-databases \
 	 cdc-wal2json cdc-test-decoding cdc-endpos-mid-txn cdc-low-level \
 	 cdc-replica-identity-index cdc-partitioned-target cdc-matview \
-	 cdc-endpos-in-multi-wal-txn cdc-file-rotation \
+	 cdc-endpos-in-multi-wal-txn cdc-file-rotation cdc-file-rotation-live \
 	 cdc-pgoutput cdc-filtering-pgoutput \
 	 follow-wal2json follow-9.6 follow-data-only \
 	 follow-pgoutput follow-filtering \
@@ -83,6 +83,9 @@ cdc-endpos-in-multi-wal-txn: build
 cdc-file-rotation: build
 	$(MAKE) -C $@
 
+cdc-file-rotation-live: build
+	$(MAKE) -C $@
+
 cdc-pgoutput: build
 	$(MAKE) -C $@
 
@@ -149,7 +152,7 @@ clean-images:
 .PHONY: toc-coverage
 .PHONY: all-databases three-databases
 .PHONY: cdc-wal2json cdc-test-decoding cdc-endpos-mid-txn cdc-low-level cdc-replica-identity-index cdc-partitioned-target
-.PHONY: cdc-endpos-in-multi-wal-txn cdc-file-rotation
+.PHONY: cdc-endpos-in-multi-wal-txn cdc-file-rotation cdc-file-rotation-live
 .PHONY: cdc-pgoutput cdc-filtering-pgoutput follow-pgoutput follow-filtering
 .PHONY: follow-wal2json follow-9.6
 .PHONY: follow-endpos-tail follow-endpos-quiet-tail follow-ddl-message-stall
