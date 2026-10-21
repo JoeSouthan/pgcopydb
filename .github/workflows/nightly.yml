@@ -118,6 +118,7 @@ jobs:
           - timescaledb
           - all-databases
           - three-databases
+          - split-table-resume
           - cdc-low-level
           - cdc-test-decoding
           - cdc-endpos-mid-txn
