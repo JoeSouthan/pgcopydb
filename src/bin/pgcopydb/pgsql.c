@@ -49,6 +49,9 @@ static void pgAutoCtlDefaultNoticeProcessor(void *arg, const char *message);
 static bool pgsql_retry_open_connection(PGSQL *pgsql);
 
 static void pgsql_handle_notifications(PGSQL *pgsql);
+static void pgsql_count_commit(PGSQL *pgsql, PGresult *result);
+static void pgsql_log_result_error(PGSQL *pgsql, PGresult *result,
+								   const char *context);
 
 static void pgsql_execute_log_error(PGSQL *pgsql,
 									PGresult *result,
@@ -1871,6 +1874,8 @@ pgsql_fetch_results(PGSQL *pgsql, bool *done,
 				return false;
 			}
 
+			pgsql_count_commit(pgsql, result);
+
 			/*
 			 * From Postgres docs:
 			 *
@@ -1990,6 +1995,214 @@ pgsql_flush_pipeline(PGSQL *pgsql)
 	}
 
 	return pgsql_sync_pipeline(pgsql);
+}
+
+
+/*
+ * pgsql_flush_output writes everything libpq has buffered for the server to
+ * the socket, without waiting for results.
+ *
+ * In pipeline mode libpq only writes once its output buffer is large enough,
+ * or at a sync. Once this returns, a process that dies does not stop the
+ * server from receiving what was written. While the socket is full, it reads
+ * results in the meantime, so that a server busy sending them is not stuck.
+ */
+bool
+pgsql_flush_output(PGSQL *pgsql)
+{
+	PGconn *conn = pgsql->connection;
+
+	if (conn == NULL)
+	{
+		log_error("BUG: pgsql_flush_output called with NULL connection");
+		return false;
+	}
+
+	for (;;)
+	{
+		int flushed = PQflush(conn);
+
+		if (flushed == 0)
+		{
+			return true;
+		}
+
+		if (flushed < 0)
+		{
+			(void) pgcopy_log_error(pgsql, NULL, "Failed to flush the connection");
+			return false;
+		}
+
+		if (asked_to_quit || asked_to_stop_fast)
+		{
+			log_error("Flushing the connection was interrupted");
+			return false;
+		}
+
+		int sock = PQsocket(conn);
+
+		if (sock < 0)
+		{
+			(void) pgcopy_log_error(pgsql, NULL, "Failed to get socket to flush");
+			return false;
+		}
+
+		fd_set input_mask;
+		fd_set output_mask;
+		struct timeval timeout = { .tv_sec = 0, .tv_usec = 10000 };
+
+		FD_ZERO(&input_mask);
+		FD_SET(sock, &input_mask);
+		FD_ZERO(&output_mask);
+		FD_SET(sock, &output_mask);
+
+		int r = select(sock + 1, &input_mask, &output_mask, NULL, &timeout);
+
+		if (r < 0 && errno != EINTR)
+		{
+			(void) pgcopy_log_error(pgsql, NULL, "select failed: %m");
+			return false;
+		}
+
+		if (r > 0 && FD_ISSET(sock, &input_mask) && PQconsumeInput(conn) == 0)
+		{
+			(void) pgsql_stream_log_error(pgsql, NULL, "Failed to consume input");
+			return false;
+		}
+	}
+}
+
+
+/*
+ * pgsql_discard_pipeline reads and drops what is left of the pipeline after
+ * an error, and leaves pipeline mode, so that the connection runs statements
+ * one at a time again. COMMITs among the results still count in
+ * pgsql->commitCount.
+ */
+bool
+pgsql_discard_pipeline(PGSQL *pgsql)
+{
+#if defined(LIBPQ_HAS_PIPELINING) && LIBPQ_HAS_PIPELINING
+	PGconn *conn = pgsql->connection;
+
+	if (conn == NULL || PQstatus(conn) == CONNECTION_BAD)
+	{
+		log_error("Failed to discard the pipeline: the connection is lost");
+		return false;
+	}
+
+	if (PQpipelineStatus(conn) == PQ_PIPELINE_OFF)
+	{
+		return true;
+	}
+
+	/* a Sync makes the server answer everything still in flight */
+	if (PQpipelineSync(conn) != 1 || !pgsql_flush_output(pgsql))
+	{
+		(void) pgcopy_log_error(pgsql, NULL, "Failed to send pipeline sync");
+		return false;
+	}
+
+	/*
+	 * PQgetResult waits for the next result while commands are pending, and
+	 * returns NULL once after each query. Two NULLs in a row mean nothing is
+	 * pending anymore.
+	 */
+	bool previousWasNull = false;
+
+	for (;;)
+	{
+		PGresult *res = PQgetResult(conn);
+
+		if (res == NULL)
+		{
+			if (PQstatus(conn) == CONNECTION_BAD)
+			{
+				(void) pgcopy_log_error(pgsql, NULL, "Failed to discard the pipeline");
+				return false;
+			}
+
+			if (previousWasNull)
+			{
+				break;
+			}
+
+			previousWasNull = true;
+			continue;
+		}
+
+		previousWasNull = false;
+
+		if (is_response_ok(res))
+		{
+			pgsql_count_commit(pgsql, res);
+		}
+
+		PQclear(res);
+	}
+
+	if (PQexitPipelineMode(conn) != 1)
+	{
+		(void) pgcopy_log_error(pgsql, NULL, "Failed to exit pipeline mode");
+		return false;
+	}
+#endif
+
+	return true;
+}
+
+
+/*
+ * pgsql_count_commit counts a successful COMMIT in pgsql->commitCount. A
+ * COMMIT of a transaction that failed reports ROLLBACK, and is not counted.
+ */
+static void
+pgsql_count_commit(PGSQL *pgsql, PGresult *result)
+{
+	if (PQresultStatus(result) == PGRES_COMMAND_OK &&
+		streq(PQcmdStatus(result), "COMMIT"))
+	{
+		++pgsql->commitCount;
+	}
+}
+
+
+/*
+ * pgsql_log_result_error logs the error of a result and keeps its SQLSTATE,
+ * without reading further results or closing the connection.
+ */
+static void
+pgsql_log_result_error(PGSQL *pgsql, PGresult *result, const char *context)
+{
+	char *sqlstate = PQresultErrorField(result, PG_DIAG_SQLSTATE);
+
+	if (sqlstate != NULL)
+	{
+		strlcpy(pgsql->sqlstate, sqlstate, sizeof(pgsql->sqlstate));
+	}
+
+	char *endpoint =
+		pgsql->connectionType == PGSQL_CONN_SOURCE ? "SOURCE" : "TARGET";
+
+	/* the message is libpq's memory: split a copy of it into lines */
+	char *message = strdup(PQresultErrorMessage(result));
+	LinesBuffer lbuf = { 0 };
+
+	if (message != NULL && splitLines(&lbuf, message))
+	{
+		for (uint64_t lineNumber = 0; lineNumber < lbuf.count; lineNumber++)
+		{
+			log_error("[%s %d] %s",
+					  endpoint,
+					  PQbackendPID(pgsql->connection),
+					  lbuf.lines[lineNumber]);
+		}
+	}
+
+	log_error("[%s %d] Context: %s",
+			  endpoint,
+			  PQbackendPID(pgsql->connection),
+			  context);
 }
 
 
@@ -2143,11 +2356,19 @@ pgsql_sync_pipeline(PGSQL *pgsql)
 				break;
 			}
 
+			/*
+			 * An error from the server leaves the connection open, and the
+			 * results after it unread: the caller can still read what the
+			 * server confirmed (see pgsql_discard_pipeline), or close it.
+			 */
 			if (!is_response_ok(res))
 			{
-				(void) pgcopy_log_error(pgsql, res, "Failed to receive pipeline sync");
+				pgsql_log_result_error(pgsql, res, "Failed to receive pipeline sync");
+				PQclear(res);
 				return false;
 			}
+
+			pgsql_count_commit(pgsql, res);
 
 			PQclear(res);
 		}

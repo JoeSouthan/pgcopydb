@@ -217,6 +217,13 @@ typedef struct PGSQL
 	 * only for connections in pipeline mode.
 	 */
 	uint64_t pipelineSyncTime;
+
+	/*
+	 * COMMIT statements the server has confirmed on this connection, in
+	 * pipeline mode or not. It only ever grows: callers that queue COMMITs
+	 * compare it with a value they read earlier.
+	 */
+	uint64_t commitCount;
 } PGSQL;
 
 
@@ -336,6 +343,8 @@ bool pgsql_fetch_results(PGSQL *pgsql, bool *done,
 bool pgsql_enable_pipeline_mode(PGSQL *pgsql);
 bool pgsql_sync_pipeline(PGSQL *pgsql);
 bool pgsql_flush_pipeline(PGSQL *pgsql);
+bool pgsql_flush_output(PGSQL *pgsql);
+bool pgsql_discard_pipeline(PGSQL *pgsql);
 
 bool pgsql_prepare(PGSQL *pgsql, const char *name, const char *sql,
 				   int paramCount, const Oid *paramTypes);

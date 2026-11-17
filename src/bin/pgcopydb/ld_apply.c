@@ -73,6 +73,10 @@ static bool stream_apply_transaction(StreamApplyContext *context,
 									 uint32_t xid,
 									 uint64_t begin_id,
 									 uint64_t commitLSN);
+static bool stream_apply_commit(StreamApplyContext *context,
+								uint64_t originLSN,
+								char *timestamp);
+static void stream_apply_rewind_origin(StreamApplyContext *context);
 
 bool stream_apply_replaydb(StreamSpecs *specs, StreamApplyContext *context);
 
@@ -205,6 +209,7 @@ stream_apply_flush_pipeline(StreamApplyContext *context)
 	if (!pgsql_flush_pipeline(&(context->applyPgConn)))
 	{
 		/* errors have already been logged */
+		(void) stream_apply_rewind_origin(context);
 		return false;
 	}
 
@@ -212,7 +217,145 @@ stream_apply_flush_pipeline(StreamApplyContext *context)
 	context->pendingTxnCount = 0;
 	context->lastFlushTime = (uint64_t) time(NULL);
 
+	context->pendingCommitCount = 0;
+	context->commitCountAtSync = context->applyPgConn.commitCount;
+
 	return true;
+}
+
+
+/*
+ * stream_apply_commit queues the COMMIT of the open target transaction, with
+ * the replication origin at originLSN.
+ *
+ * PostgreSQL 16 and later move a replication origin forward when a
+ * transaction aborts after pg_replication_origin_xact_setup(): an abort there
+ * leaves the origin on a transaction the target never committed, and the next
+ * apply starts after it. So nothing that can fail runs between the setup and
+ * the COMMIT. Deferred constraint triggers run before the setup, and the setup
+ * and the COMMIT are written to the socket together: stopping the apply cannot
+ * leave the server with one and not the other. Should a COMMIT fail all the
+ * same, stream_apply_rewind_origin moves the origin back.
+ */
+static bool
+stream_apply_commit(StreamApplyContext *context, uint64_t originLSN,
+					char *timestamp)
+{
+	PGSQL *applyPgConn = &(context->applyPgConn);
+
+	if (context->pendingCommitCount == APPLY_PENDING_COMMITS_MAX &&
+		!stream_apply_flush_pipeline(context))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	char lsn[PG_LSN_MAXLENGTH] = { 0 };
+
+	sformat(lsn, sizeof(lsn), "%X/%X", LSN_FORMAT_ARGS(originLSN));
+
+	/* send what was queued, so that the setup and the COMMIT go out alone */
+	if (!pgsql_execute(applyPgConn, "SET CONSTRAINTS ALL IMMEDIATE") ||
+		!pgsql_flush_output(applyPgConn) ||
+		!pgsql_replication_origin_xact_setup(applyPgConn, lsn, timestamp) ||
+		!pgsql_execute(applyPgConn, "COMMIT") ||
+		!pgsql_flush_output(applyPgConn))
+	{
+		log_error("Failed to commit at origin LSN %s, see above for details",
+				  lsn);
+		(void) stream_apply_rewind_origin(context);
+		return false;
+	}
+
+	context->pendingCommitLSN[context->pendingCommitCount++] = originLSN;
+
+	return true;
+}
+
+
+/*
+ * stream_apply_rewind_origin moves the replication origin back to the last
+ * COMMIT the target confirmed, once apply has failed.
+ *
+ * The COMMITs queued since the last sync are in pendingCommitLSN, in order,
+ * and applyPgConn.commitCount counts those the server confirmed. Should the
+ * origin be past the last of them, a COMMIT failed after its origin setup, and
+ * the origin goes back. It only ever moves back to a COMMIT the target
+ * confirmed: getting this wrong replays a transaction already applied, which
+ * fails loudly, rather than skip one.
+ *
+ * Without the connection there is nothing to read the confirmations from.
+ */
+static void
+stream_apply_rewind_origin(StreamApplyContext *context)
+{
+	PGSQL *applyPgConn = &(context->applyPgConn);
+
+	if (applyPgConn->connection == NULL)
+	{
+		log_warn("Lost the connection to the target: replication origin "
+				 "\"%s\" was not checked after the failure",
+				 context->origin);
+		return;
+	}
+
+	/* read the COMMITs the server confirmed before it failed */
+	if (!pgsql_discard_pipeline(applyPgConn))
+	{
+		log_warn("Replication origin \"%s\" was not checked after the failure, "
+				 "see above for details",
+				 context->origin);
+		return;
+	}
+
+	uint64_t confirmed = applyPgConn->commitCount - context->commitCountAtSync;
+
+	if (confirmed > (uint64_t) context->pendingCommitCount)
+	{
+		confirmed = (uint64_t) context->pendingCommitCount;
+	}
+
+	uint64_t lastCommitLSN =
+		confirmed > 0
+		? context->pendingCommitLSN[confirmed - 1]
+		: context->confirmedLSN;
+
+	uint64_t originLSN = InvalidXLogRecPtr;
+
+	if (!pgsql_execute(applyPgConn, "ROLLBACK") ||
+		!pgsql_execute(applyPgConn, "SELECT pg_replication_origin_session_reset()") ||
+		!pgsql_replication_origin_progress(applyPgConn,
+										   context->origin,
+										   false,
+										   &originLSN))
+	{
+		log_error("Failed to check replication origin \"%s\" after the "
+				  "failure: it must not be past %X/%X",
+				  context->origin,
+				  LSN_FORMAT_ARGS(lastCommitLSN));
+		return;
+	}
+
+	if (originLSN <= lastCommitLSN)
+	{
+		return;
+	}
+
+	char lsn[PG_LSN_MAXLENGTH] = { 0 };
+
+	sformat(lsn, sizeof(lsn), "%X/%X", LSN_FORMAT_ARGS(lastCommitLSN));
+
+	log_warn("Moving replication origin \"%s\" back from %X/%X to %s, "
+			 "the last COMMIT the target confirmed",
+			 context->origin,
+			 LSN_FORMAT_ARGS(originLSN),
+			 lsn);
+
+	if (!pgsql_replication_origin_advance(applyPgConn, context->origin, lsn))
+	{
+		log_error("Failed to move replication origin \"%s\" back to %s",
+				  context->origin, lsn);
+	}
 }
 
 
@@ -445,6 +588,8 @@ stream_apply_replaydb(StreamSpecs *specs, StreamApplyContext *context)
 	context->confirmedLSN = context->previousLSN;
 	context->pendingTxnCount = 0;
 	context->lastFlushTime = (uint64_t) time(NULL);
+	context->pendingCommitCount = 0;
+	context->commitCountAtSync = context->applyPgConn.commitCount;
 
 	int syncCounter = 0;
 	int stalledPasses = 0;
@@ -1259,11 +1404,6 @@ stream_apply_transaction(StreamApplyContext *context,
 		return false;
 	}
 
-	/* set replication origin to commitLSN before committing */
-	char lsn[PG_LSN_MAXLENGTH] = { 0 };
-
-	sformat(lsn, sizeof(lsn), "%X/%X", LSN_FORMAT_ARGS(commitLSN));
-
 	if (IS_EMPTY_STRING_BUFFER(commitTimestamp))
 	{
 		TimestampTz now = feGetCurrentTimestamp();
@@ -1273,21 +1413,14 @@ stream_apply_transaction(StreamApplyContext *context,
 										   sizeof(commitTimestamp));
 	}
 
-	if (!pgsql_replication_origin_xact_setup(applyPgConn, lsn, commitTimestamp))
-	{
-		log_error("Failed to setup replication origin for xid %u at %X/%X",
-				  xid, LSN_FORMAT_ARGS(commitLSN));
-		context->appliedGucs = NULL;
-		(void) pgsql_execute(applyPgConn, "ROLLBACK");
-		context->transactionInProgress = false;
-		return false;
-	}
-
 	log_debug("COMMIT xid %u LSN %X/%X", xid, LSN_FORMAT_ARGS(commitLSN));
 
-	if (!pgsql_execute(applyPgConn, "COMMIT"))
+	/* the replication origin moves to commitLSN */
+	if (!stream_apply_commit(context, commitLSN, commitTimestamp))
 	{
-		/* errors have already been logged */
+		log_error("Failed to commit xid %u at %X/%X",
+				  xid, LSN_FORMAT_ARGS(commitLSN));
+		context->appliedGucs = NULL;
 		context->transactionInProgress = false;
 		return false;
 	}
@@ -2045,7 +2178,7 @@ stream_apply_cleanup(StreamApplyContext *context)
 	 * Drain the pipeline before closing: PQfinish() discards anything still
 	 * buffered, and on this connection that can include COMMITs.
 	 */
-	(void) pgsql_flush_pipeline(&(context->applyPgConn));
+	(void) stream_apply_flush_pipeline(context);
 
 	/* make sure we close the connection on the way out */
 	(void) pgsql_finish(&(context->controlPgConn));
@@ -2491,31 +2624,12 @@ stream_apply_sql(StreamApplyContext *context,
 				return true;
 			}
 
-			/*
-			 * update replication progress with metadata->lsn, that is,
-			 * transaction COMMIT LSN
-			 */
-			char lsn[PG_LSN_MAXLENGTH] = { 0 };
-
-			sformat(lsn, sizeof(lsn), "%X/%X",
-					LSN_FORMAT_ARGS(metadata->lsn));
-
-			if (!pgsql_replication_origin_xact_setup(applyPgConn,
-													 lsn,
-													 metadata->timestamp))
-			{
-				log_error("Failed to setup apply transaction, "
-						  "see above for details");
-				return false;
-			}
-
 			log_trace("COMMIT %lld LSN %X/%X",
 					  (long long) metadata->xid,
 					  LSN_FORMAT_ARGS(metadata->lsn));
 
-
-			/* calling pgsql_commit() would finish the connection, avoid */
-			if (!pgsql_execute(applyPgConn, "COMMIT"))
+			/* the replication origin moves to the transaction COMMIT LSN */
+			if (!stream_apply_commit(context, metadata->lsn, metadata->timestamp))
 			{
 				/* errors have already been logged */
 				return false;
@@ -2734,21 +2848,7 @@ stream_apply_sql(StreamApplyContext *context,
 				? context->previousLSN
 				: metadata->lsn;
 
-			char lsn[PG_LSN_MAXLENGTH] = { 0 };
-
-			sformat(lsn, sizeof(lsn), "%X/%X",
-					LSN_FORMAT_ARGS(originLSN));
-
-			if (!pgsql_replication_origin_xact_setup(applyPgConn,
-													 lsn,
-													 metadata->timestamp))
-			{
-				/* errors have already been logged */
-				return false;
-			}
-
-			/* calling pgsql_commit() would finish the connection, avoid */
-			if (!pgsql_execute(applyPgConn, "COMMIT"))
+			if (!stream_apply_commit(context, originLSN, metadata->timestamp))
 			{
 				/* errors have already been logged */
 				return false;
@@ -3317,6 +3417,11 @@ setupReplicationOrigin(StreamApplyContext *context)
 		/* errors have already been logged */
 		return false;
 	}
+
+	/* the origin is at previousLSN, and no COMMIT is queued yet */
+	context->confirmedLSN = context->previousLSN;
+	context->pendingCommitCount = 0;
+	context->commitCountAtSync = applyPgConn->commitCount;
 
 	return true;
 }
