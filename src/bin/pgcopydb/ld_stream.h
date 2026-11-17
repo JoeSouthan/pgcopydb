@@ -617,6 +617,12 @@ typedef struct LSNTracking
 } LSNTracking;
 
 /*
+ * Most COMMITs apply queues on its connection between two syncs. It syncs
+ * before queueing one more.
+ */
+#define APPLY_PENDING_COMMITS_MAX 1024
+
+/*
  * StreamApplyContext allows tracking the apply progress.
  */
 typedef struct StreamApplyContext
@@ -648,6 +654,14 @@ typedef struct StreamApplyContext
 	                             * previousLSN -- see stream_apply_flush_pipeline */
 	int pendingTxnCount;        /* transactions queued since the last sync */
 	uint64_t lastFlushTime;     /* time(NULL) of the last successful sync */
+
+	/*
+	 * Origin LSN of each COMMIT queued since the last sync, in order, and
+	 * applyPgConn.commitCount at that sync: see stream_apply_rewind_origin.
+	 */
+	uint64_t pendingCommitLSN[APPLY_PENDING_COMMITS_MAX];
+	int pendingCommitCount;
+	uint64_t commitCountAtSync;
 	uint64_t keepaliveLSN;      /* last KEEPALIVE consumed, cursor only */
 	uint64_t switchLSN;         /* LSN of the most recent SWITCH WAL message */
 
