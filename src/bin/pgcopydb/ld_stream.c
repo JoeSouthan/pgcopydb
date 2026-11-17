@@ -685,6 +685,13 @@ startLogicalStreaming(StreamSpecs *specs)
 
 	(void) pipeline_state_start(specs->sourceDB, "receive", specs->startpos);
 
+	/* before START_REPLICATION, so wal_sender_timeout does not run meanwhile */
+	if (!ld_store_upgrade_outputdb(specs))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
 	/*
 	 * In case of being disconnected or other transient errors, reconnect and
 	 * continue streaming.
@@ -1793,6 +1800,34 @@ prepareMessageMetadataFromContext(LogicalStreamContext *context)
 		log_error("Failed to parse header from logical decoding message: %s",
 				  context->buffer);
 		return false;
+	}
+
+	/*
+	 * Every tuple of a multi-insert WAL record (COPY) decodes at the same LSN,
+	 * so output rows are keyed on seq too.  A send always starts at BEGIN, so
+	 * a re-sent change gets the same seq again and replaces its row.
+	 */
+	switch (metadata->action)
+	{
+		case STREAM_ACTION_BEGIN:
+		{
+			privateContext->changeSeq = 0;
+			break;
+		}
+
+		case STREAM_ACTION_INSERT:
+		case STREAM_ACTION_UPDATE:
+		case STREAM_ACTION_DELETE:
+		case STREAM_ACTION_TRUNCATE:
+		{
+			metadata->seq = ++privateContext->changeSeq;
+			break;
+		}
+
+		default:
+		{
+			break;
+		}
 	}
 
 	/* in case of filtering, early exit */

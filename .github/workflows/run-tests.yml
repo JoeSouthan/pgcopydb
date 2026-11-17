@@ -141,6 +141,7 @@ jobs:
           - follow-restart
           - cdc-file-rotation-live
           - cdc-concurrent-backlog
+          - cdc-copy-multi-insert
         exclude:
           # timescaledb uses timescale/timescaledb:latest-pg13 for both source
           # and target. pg_restore from PG17+ emits "SET transaction_timeout = 0"
@@ -182,6 +183,8 @@ jobs:
           - TEST: follow-endpos-quiet-tail
             PGVERSION: 16
           - TEST: follow-ddl-message-stall
+            PGVERSION: 16
+          - TEST: cdc-copy-multi-insert
             PGVERSION: 16
           - TEST: follow-restart
             PGVERSION: 16

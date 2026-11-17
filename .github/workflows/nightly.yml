@@ -127,6 +127,7 @@ jobs:
           - cdc-file-rotation
           - cdc-file-rotation-live
           - cdc-concurrent-backlog
+          - cdc-copy-multi-insert
           - cdc-pgoutput
           - cdc-filtering-pgoutput
           - follow-wal2json
