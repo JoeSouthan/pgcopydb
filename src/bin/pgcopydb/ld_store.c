@@ -137,6 +137,38 @@ ld_store_open_outputdb(StreamSpecs *specs)
 
 
 /*
+ * ld_store_upgrade_outputdb opens the output.db that receive resumes writing
+ * to, when there is one, and upgrades it from an older pgcopydb.  It runs
+ * before START_REPLICATION, so that an index build on a large file does not
+ * count against wal_sender_timeout.  Apply only reads output.db, and reads no
+ * column that the upgrade adds.
+ */
+bool
+ld_store_upgrade_outputdb(StreamSpecs *specs)
+{
+	DatabaseCatalog *outputDB = specs->outputDB;
+
+	if (IS_EMPTY_STRING_BUFFER(outputDB->dbfile) &&
+		!ld_store_set_current_cdc_filename(specs))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* no output.db yet: stream_init_timeline creates it with the new schema */
+	if (IS_EMPTY_STRING_BUFFER(outputDB->dbfile) ||
+		!file_exists(outputDB->dbfile))
+	{
+		return true;
+	}
+
+	outputDB->type = DATABASE_CATALOG_TYPE_OUTPUT;
+
+	return catalog_init(outputDB) && catalog_upgrade_output_schema(outputDB);
+}
+
+
+/*
  * ld_store_open_replaydb opens (or creates) the replay.db file for apply.
  *
  * replay.db contains stmt and replay tables and is written exclusively by
@@ -716,7 +748,7 @@ ld_store_lookup_output_after_lsn(DatabaseCatalog *catalog,
 	 * the id boundary of everything already applied.
 	 *
 	 * That row is the highest-LSN commit at or below transform_lsn, one seek
-	 * on o_a_lsn: max(id) would read every commit up to it.
+	 * on o_a_lsn_seq: max(id) would read every commit up to it.
 	 */
 
 	/*
@@ -1744,8 +1776,8 @@ ld_store_insert_message(DatabaseCatalog *catalog,
 	}
 
 	char *sql =
-		"insert or replace into output(action, xid, lsn, timestamp, message)"
-		"values($1, $2, $3, $4, $5) ";
+		"insert or replace into output(action, xid, lsn, timestamp, message, seq)"
+		"values($1, $2, $3, $4, $5, $6) ";
 
 	if (!semaphore_lock(&(catalog->sema)))
 	{
@@ -1780,7 +1812,8 @@ ld_store_insert_message(DatabaseCatalog *catalog,
 		{ xidParamType, "xid", metadata->xid, NULL },
 		{ BIND_PARAMETER_TYPE_INT64, "lsn", metadata->lsn, NULL },
 		{ BIND_PARAMETER_TYPE_TEXT, "timestamp", 0, metadata->timestamp },
-		{ BIND_PARAMETER_TYPE_TEXT, "message", 0, metadata->jsonBuffer }
+		{ BIND_PARAMETER_TYPE_TEXT, "message", 0, metadata->jsonBuffer },
+		{ BIND_PARAMETER_TYPE_INT64, "seq", metadata->seq, NULL }
 	};
 
 	int count = sizeof(params) / sizeof(params[0]);
@@ -1835,8 +1868,8 @@ ld_store_insert_pgoutput_message(DatabaseCatalog *catalog,
 	/* --- INSERT into output --- */
 	char *output_sql =
 		"insert or replace into output"
-		"  (action, xid, lsn, timestamp, message, nspname, relname, old_type)"
-		"  values($1, $2, $3, $4, $5, $6, $7, $8)";
+		"  (action, xid, lsn, timestamp, message, nspname, relname, old_type, seq)"
+		"  values($1, $2, $3, $4, $5, $6, $7, $8, $9)";
 
 	SQLiteQuery oq = { 0 };
 	if (!catalog_sql_prepare_cached(catalog, output_sql, &oq))
@@ -1882,7 +1915,8 @@ ld_store_insert_pgoutput_message(DatabaseCatalog *catalog,
 		{
 			pgmsg->oldType != 0 ? BIND_PARAMETER_TYPE_TEXT : BIND_PARAMETER_TYPE_NULL,
 			"old_type", 0, pgmsg->oldType != 0 ? old_type_str : NULL
-		}
+		},
+		{ BIND_PARAMETER_TYPE_INT64, "seq", metadata->seq, NULL }
 	};
 
 	if (!catalog_sql_bind(&oq, oparams, lengthof(oparams)))

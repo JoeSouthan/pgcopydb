@@ -63,6 +63,7 @@ bool catalog_set_wal_mode(DatabaseCatalog *catalog);
 
 bool catalog_begin(DatabaseCatalog *catalog, bool immediate);
 bool catalog_commit(DatabaseCatalog *catalog);
+bool catalog_upgrade_output_schema(DatabaseCatalog *catalog);
 bool catalog_in_transaction(DatabaseCatalog *catalog);
 
 bool catalog_register_setup(DatabaseCatalog *catalog,

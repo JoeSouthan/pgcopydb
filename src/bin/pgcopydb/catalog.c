@@ -615,9 +615,11 @@ static char *outputDBcreateDDLs[] = {
 	"  id integer primary key, "
 	"  action text, xid integer, lsn integer, timestamp text, "
 	"  message text, "
-	"  nspname text, relname text, old_type text)",
+	"  nspname text, relname text, old_type text, "
+	"  seq integer not null default 0)",
 
-	"create unique index o_a_lsn on output(action, lsn)",
+	/* the tuples of a multi-insert WAL record share their lsn */
+	"create unique index o_a_lsn_seq on output(action, lsn, seq)",
 	"create index o_a_xid on output(action, xid)",
 
 	/* the next BEGIN after a given row id, see ld_store_lookup_output_after_lsn */
@@ -2054,7 +2056,7 @@ catalog_begin(DatabaseCatalog *catalog, bool immediate)
 			/* we have milliseconds, pg_usleep() wants microseconds */
 			(void) pg_usleep(sleepTimeMs * 1000);
 
-			rc = sqlite3_exec(catalog->db, "BEGIN", NULL, NULL, NULL);
+			rc = sqlite3_exec(catalog->db, sql, NULL, NULL, NULL);
 		}
 	}
 
@@ -2063,6 +2065,110 @@ catalog_begin(DatabaseCatalog *catalog, bool immediate)
 		log_error("[SQLite] Failed to %s", sql);
 		return false;
 	}
+
+	return true;
+}
+
+
+/*
+ * catalog_output_lacks_seq sets lacksSeq when the output table predates the
+ * seq column.
+ */
+static bool
+catalog_output_lacks_seq(DatabaseCatalog *catalog, bool *lacksSeq)
+{
+	char *sql =
+		"select not exists(select 1 from pragma_table_info('output') "
+		"                   where name = 'seq')";
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(catalog->db, sql, &query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (catalog_sql_step(&query) != SQLITE_ROW)
+	{
+		log_error("Failed to check the output table of \"%s\": %s",
+				  catalog->dbfile,
+				  sqlite3_errmsg(catalog->db));
+		(void) catalog_sql_finalize(&query);
+		return false;
+	}
+
+	*lacksSeq = sqlite3_column_int(query.ppStmt, 0) == 1;
+
+	return catalog_sql_finalize(&query);
+}
+
+
+/*
+ * catalog_upgrade_output_schema rekeys an output.db written by an older
+ * pgcopydb, whose rows are unique on (action, lsn) and so keep only one tuple
+ * of each multi-insert WAL record, so that receive can resume writing to it.
+ * Rows lost before the upgrade stay lost.  Only receive writes output.db, so
+ * only receive runs this.
+ */
+bool
+catalog_upgrade_output_schema(DatabaseCatalog *catalog)
+{
+	char *ddls[] = {
+		"alter table output add column seq integer not null default 0",
+		"drop index if exists o_a_lsn",
+		"create unique index o_a_lsn_seq on output(action, lsn, seq)"
+	};
+
+	bool lacksSeq = false;
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!catalog_begin(catalog, true))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	if (!catalog_output_lacks_seq(catalog, &lacksSeq))
+	{
+		/* errors have already been logged */
+		(void) catalog_execute(catalog, "ROLLBACK");
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	if (lacksSeq)
+	{
+		log_notice("Adding column output.seq to \"%s\"", catalog->dbfile);
+
+		int count = sizeof(ddls) / sizeof(ddls[0]);
+
+		for (int i = 0; i < count; i++)
+		{
+			if (!catalog_execute(catalog, ddls[i]))
+			{
+				/* errors have already been logged */
+				(void) catalog_execute(catalog, "ROLLBACK");
+				(void) semaphore_unlock(&(catalog->sema));
+				return false;
+			}
+		}
+	}
+
+	if (!catalog_commit(catalog))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
 
 	return true;
 }

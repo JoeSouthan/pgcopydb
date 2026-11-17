@@ -58,6 +58,7 @@ typedef struct ReplayDBStmt
 
 
 bool ld_store_open_outputdb(StreamSpecs *specs);
+bool ld_store_upgrade_outputdb(StreamSpecs *specs);
 bool ld_store_open_replaydb(StreamSpecs *specs);
 
 bool ld_store_set_first_cdc_filename(StreamSpecs *specs);
