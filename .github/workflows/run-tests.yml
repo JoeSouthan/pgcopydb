@@ -139,6 +139,8 @@ jobs:
           - follow-endpos-quiet-tail
           - follow-ddl-message-stall
           - follow-restart
+          - cdc-file-rotation-live
+          - cdc-concurrent-backlog
         exclude:
           # timescaledb uses timescale/timescaledb:latest-pg13 for both source
           # and target. pg_restore from PG17+ emits "SET transaction_timeout = 0"
@@ -182,6 +184,10 @@ jobs:
           - TEST: follow-ddl-message-stall
             PGVERSION: 16
           - TEST: follow-restart
+            PGVERSION: 16
+          - TEST: cdc-file-rotation-live
+            PGVERSION: 16
+          - TEST: cdc-concurrent-backlog
             PGVERSION: 16
     steps:
       - name: Checkout repository
