@@ -26,6 +26,9 @@ set -e
 # missing on the target (as a partition created on the source only does),
 # inserts rows while the sub-processes restart, then creates the table on
 # the target so that apply can carry on.  Every row must reach the target.
+#
+# Then pruning the applied CDC files must remove each of them with its -wal
+# and -shm files, never leave those behind on their own.
 
 ROWS=50
 
@@ -146,5 +149,28 @@ echo "rows: source ${src}, target ${tgt}"
 test $((ROWS + 10 + 15 + 10)) -eq "${src}"
 test "${src}" -eq "${tgt}"
 test "$(count_rows ${PGCOPYDB_TARGET_PGURI} victim)" -eq 1
+
+#
+# pruning the applied CDC files removes their -wal and -shm files too.  The
+# sub-processes that were killed in the restarts may or may not have left
+# some behind, so make sure that every CDC file has them.
+#
+cdc=${XDG_DATA_HOME:-${HOME}/.local/share}/pgcopydb
+
+for f in ${cdc}/*-output.db ${cdc}/*-replay.db
+do
+    test -e "${f}-wal" || touch "${f}-wal"
+    test -e "${f}-shm" || touch "${f}-shm"
+done
+
+pgcopydb stream prune > /tmp/prune.log 2>&1
+cat /tmp/prune.log
+grep "Removed CDC output file" /tmp/prune.log
+
+for f in ${cdc}/*-wal ${cdc}/*-shm
+do
+    test -e "${f}" || continue
+    test -e "${f%-???}" || { echo "left behind: ${f}"; exit 1; }
+done
 
 pgcopydb stream cleanup
