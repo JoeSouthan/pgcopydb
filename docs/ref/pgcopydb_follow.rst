@@ -529,6 +529,13 @@ The following options are available to ``pgcopydb follow``:
   ``--max-restarts -1`` to restart without a limit. The window starts at the
   first failure; a failure that comes after it has elapsed starts a new one.
 
+--max-replaydb-size
+
+  Maximum on-disk size of a single SQLite ``output.db`` file before it is
+  rotated to a new file pair.  Accepts human-readable units: ``1kB``,
+  ``500MB``, ``1GB``, etc.  Defaults to ``1GB``.  See
+  :ref:`pgcopydb_stream` for details.
+
 --endpos
 
   Logical decoding target LSN to use. Automatically stop replication and
