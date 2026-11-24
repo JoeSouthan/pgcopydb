@@ -826,20 +826,82 @@ ld_store_lookup_output_after_lsn(DatabaseCatalog *catalog,
 		"order by lsn, id "
 		"limit 1";
 
+	/*
+	 * After a reconnect or a restart, receive sends again every transaction
+	 * above the slot's confirmed position, and INSERT OR REPLACE gives each
+	 * rewritten row a new id, while its LSN stays.  Until receive has written
+	 * a transaction's COMMIT again, its new BEGIN has a higher id than the old
+	 * rows of the transactions that commit after it, so the id order above
+	 * hands one of those out first.  Applying it moves the origin past the
+	 * COMMIT of the transaction being sent again, which is then never applied.
+	 *
+	 * So when a COMMIT above lsn exists, the next transaction is the one with
+	 * the lowest such COMMIT, whose LSN does not change on a re-send, and its
+	 * body starts at the newest BEGIN for its xid.  When receive is still
+	 * rewriting it, ld_store_lookup_output_xid_end reports it incomplete and
+	 * the caller waits for it.  The id order above is kept for what has no
+	 * COMMIT above lsn: an open transaction, or one ended by a ROLLBACK.
+	 */
+	static const char *commitSQL =
+		"select id, action, xid, lsn, timestamp, message, nspname, relname, old_type "
+		"  from output "
+		" where action = 'C' and lsn > $1 "
+		"order by lsn "
+		"limit 1";
+
+	static const char *newestBeginSQL =
+		"select id, action, xid, lsn, timestamp, message, nspname, relname, old_type "
+		"  from output "
+		" where action = 'B' and xid = $1 "
+		"order by id desc "
+		"limit 1";
+
 	log_debug("ld_store_lookup_output_after_lsn: %X/%X (keepalive %X/%X)",
 			  LSN_FORMAT_ARGS(lsn),
 			  LSN_FORMAT_ARGS(keepaliveLSN));
 
 	ReplayDBOutputMessage next = { 0 };
+	ReplayDBOutputMessage nextCommit = { 0 };
 
-	BindParam beginParams[] = {
+	BindParam commitParams[] = {
 		{ BIND_PARAMETER_TYPE_INT64, "lsn", lsn, NULL }
 	};
 
-	if (!ld_store_lookup_output_one(catalog, beginSQL, beginParams, 1, &next))
+	if (!ld_store_lookup_output_one(catalog, commitSQL, commitParams, 1,
+									&nextCommit))
 	{
 		/* errors have already been logged */
 		return false;
+	}
+
+	if (nextCommit.lsn != InvalidXLogRecPtr)
+	{
+		BindParam xidParams[] = {
+			{ BIND_PARAMETER_TYPE_INT64, "xid", nextCommit.xid, NULL }
+		};
+
+		if (!ld_store_lookup_output_one(catalog, newestBeginSQL, xidParams, 1,
+										&next))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+	}
+
+	/* no COMMIT above lsn, or no BEGIN for it: the id order above */
+	if (next.lsn == InvalidXLogRecPtr)
+	{
+		nextCommit.lsn = InvalidXLogRecPtr;
+
+		BindParam beginParams[] = {
+			{ BIND_PARAMETER_TYPE_INT64, "lsn", lsn, NULL }
+		};
+
+		if (!ld_store_lookup_output_one(catalog, beginSQL, beginParams, 1, &next))
+		{
+			/* errors have already been logged */
+			return false;
+		}
 	}
 
 	char *markers[] = { "K", "X" };
@@ -860,10 +922,20 @@ ld_store_lookup_output_after_lsn(DatabaseCatalog *catalog,
 			return false;
 		}
 
-		if (marker.lsn != InvalidXLogRecPtr &&
-			(next.lsn == InvalidXLogRecPtr || marker.id < next.id))
+		/*
+		 * Against a transaction found by its COMMIT, compare LSNs: the rows
+		 * of a transaction that receive is sending again have new ids, and a
+		 * marker written before that, above its COMMIT, must not go first.
+		 */
+		bool markerFirst =
+			nextCommit.lsn != InvalidXLogRecPtr
+			? marker.lsn < nextCommit.lsn
+			: (next.lsn == InvalidXLogRecPtr || marker.id < next.id);
+
+		if (marker.lsn != InvalidXLogRecPtr && markerFirst)
 		{
 			next = marker;
+			nextCommit.lsn = InvalidXLogRecPtr;
 		}
 	}
 
@@ -899,11 +971,18 @@ ld_store_lookup_output_xid_end(DatabaseCatalog *catalog,
 	 * re-delivers the complete transaction, the real COMMIT is inserted with
 	 * a higher id than the stale ROLLBACK.  Ordering by COMMIT first ensures
 	 * we find the real COMMIT rather than the stale ROLLBACK.
+	 *
+	 * An end row only counts above the newest BEGIN of the xid.  After a
+	 * reconnect, receive sends the transaction again and gives each rewritten
+	 * row a new id: until it has written the COMMIT again, the rows after the
+	 * newest BEGIN are partial, so report no end row and let the caller wait.
 	 */
 	char *sql =
 		"  select id, action, xid, lsn, timestamp, message, nspname, relname, old_type "
 		"    from output "
 		"   where xid = $1 and (action = 'C' or action = 'R') "
+		"     and id > coalesce((select max(id) from output "
+		"                         where action = 'B' and xid = $1), 0) "
 		"order by case when action = 'C' then 0 else 1 end, id "
 		"   limit 1";
 
@@ -949,22 +1028,19 @@ ld_store_lookup_output_xid_end(DatabaseCatalog *catalog,
 
 
 /*
- * ld_store_lookup_output_complete_txn returns the oldest complete transaction
- * in the output table that commits after previousLSN and at or before endpos,
- * with the commit LSN in output->lsn.  output->lsn is InvalidXLogRecPtr when
- * there is none.
+ * ld_store_lookup_output_complete_txn returns the oldest transaction in the
+ * output table that commits after previousLSN and at or before endpos, with
+ * the commit LSN in output->lsn.  output->lsn is InvalidXLogRecPtr when there
+ * is none.
  *
- * The join to the COMMIT row is what makes a transaction count as complete: an
- * endpos that falls inside a transaction still leaves nothing to drain here,
- * which is how the apply loop terminates in that case.
+ * The COMMIT row is what makes a transaction count: an endpos that falls
+ * inside a transaction still leaves nothing to drain here, which is how the
+ * apply loop terminates in that case.
  *
  * Only a COMMIT terminates a transaction for this purpose.  A ROLLBACK leaves
  * previousLSN where it was, by design, so counting one as work left to drain
  * would hold the window open on a transaction the apply is never going to
- * move past.  ld_store_lookup_output_xid_end documents the reconnect case
- * where one xid carries both a stale artificial ROLLBACK and the re-delivered
- * real COMMIT; correlating on c.id > b.id keeps the stale row from pairing
- * with the later BEGIN.
+ * move past.
  */
 bool
 ld_store_lookup_output_complete_txn(DatabaseCatalog *catalog,
@@ -982,17 +1058,19 @@ ld_store_lookup_output_complete_txn(DatabaseCatalog *catalog,
 	sqlite3 *db = catalog->db;
 
 	/*
-	 * The BEGIN row carries the transaction, the C/R row carries the position
-	 * the apply compares against: report c.lsn as the row lsn.  The message
-	 * body is never read here, so select null for it and skip its malloc.
+	 * The COMMIT row carries the position the apply compares against.  It
+	 * counts even when receive is sending its transaction again after a
+	 * reconnect, with a rewritten BEGIN above it: that transaction is left to
+	 * apply, and the drain must wait for it rather than finish without it.
+	 * The message body is never read here, so select null for it and skip
+	 * its malloc.
 	 */
 	char *sql =
-		"  select b.id, b.action, b.xid, c.lsn, b.timestamp, null, "
-		"         b.nspname, b.relname, b.old_type "
-		"    from output b "
-		"    join output c on c.xid = b.xid and c.action = 'C' and c.id > b.id "
-		"   where b.action = 'B' and c.lsn > $1 and c.lsn <= $2 "
-		"order by c.lsn asc "
+		"  select id, action, xid, lsn, timestamp, null, "
+		"         nspname, relname, old_type "
+		"    from output "
+		"   where action = 'C' and lsn > $1 and lsn <= $2 "
+		"order by lsn asc "
 		"   limit 1";
 
 	log_debug("ld_store_lookup_output_complete_txn: %X/%X .. %X/%X",
