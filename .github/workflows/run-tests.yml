@@ -139,6 +139,8 @@ jobs:
           - follow-endpos-quiet-tail
           - follow-ddl-message-stall
           - follow-restart
+          - cdc-interleaved-commits
+          - cdc-commit-order-resume
         exclude:
           # timescaledb uses timescale/timescaledb:latest-pg13 for both source
           # and target. pg_restore from PG17+ emits "SET transaction_timeout = 0"
