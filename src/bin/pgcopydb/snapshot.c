@@ -506,5 +506,19 @@ copydb_create_logical_replication_slot(CopyDataSpec *copySpecs,
 		return false;
 	}
 
+	/*
+	 * The output.db is registered in cdc_files now, which is where receive
+	 * finds it.  Keep neither its handle nor its name: the follow
+	 * sub-processes are forked from this process, and a receive restarted
+	 * after it rotated to another file would spool into this one again.
+	 */
+	if (!catalog_close(specs.outputDB))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	memset(specs.outputDB->dbfile, 0, sizeof(specs.outputDB->dbfile));
+
 	return true;
 }

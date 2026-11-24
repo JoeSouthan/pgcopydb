@@ -68,6 +68,7 @@
 	"  --enable-failover             Create the replication slot with FAILOVER (Postgres 17+)\n" \
 	"  --max-restarts <n>            Restart failed follow sub-processes at most n times (default 5)\n" \
 	"  --restart-window <seconds>    ... within this many seconds (default 300)\n" \
+	"  --max-replaydb-size <size>    Rotate CDC files at this size (default 1GB)\n" \
 	"  --origin                      Use this Postgres replication origin node name\n" \
 	"  --endpos                      Stop replaying changes when reaching this LSN\n" \
 	"  --use-copy-binary             Use the COPY BINARY format for COPY operations\n" \
@@ -112,6 +113,7 @@ CommandLine follow_command =
 		"  --enable-failover             Create the replication slot with FAILOVER (Postgres 17+)\n"
 		"  --max-restarts <n>            Restart failed follow sub-processes at most n times (default 5)\n"
 		"  --restart-window <seconds>    ... within this many seconds (default 300)\n"
+		"  --max-replaydb-size <size>    Rotate CDC files at this size (default 1GB)\n"
 		"  --origin                      Use this Postgres replication origin node name\n"
 		"  --endpos                      Stop replaying changes when reaching this LSN\n",
 		cli_copy_db_getopts,

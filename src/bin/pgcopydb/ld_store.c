@@ -25,6 +25,9 @@
 #include "file_utils.h"
 #include "string_utils.h"
 
+static bool ld_store_fetch_current_cdc_filename(DatabaseCatalog *sourceDB,
+												char *filename);
+
 
 /*
  * ld_store_replaydb_filename_from_outputdb derives the replay.db path from the
@@ -282,11 +285,24 @@ ld_store_set_first_cdc_filename(StreamSpecs *specs)
 bool
 ld_store_set_current_cdc_filename(StreamSpecs *specs)
 {
-	sqlite3 *db = specs->sourceDB->db;
+	return ld_store_fetch_current_cdc_filename(specs->sourceDB,
+											   specs->outputDB->dbfile);
+}
+
+
+/*
+ * ld_store_fetch_current_cdc_filename copies the filename of the most recently
+ * created open output.db in cdc_files to filename, a MAXPGPATH buffer that is
+ * left untouched when there is none.
+ */
+static bool
+ld_store_fetch_current_cdc_filename(DatabaseCatalog *sourceDB, char *filename)
+{
+	sqlite3 *db = sourceDB->db;
 
 	if (db == NULL)
 	{
-		log_error("BUG: ld_store_set_current_cdc_filename: db is NULL");
+		log_error("BUG: ld_store_fetch_current_cdc_filename: db is NULL");
 		return false;
 	}
 
@@ -298,7 +314,7 @@ ld_store_set_current_cdc_filename(StreamSpecs *specs)
 		"   limit 1";
 
 	SQLiteQuery query = {
-		.context = specs->outputDB->dbfile,
+		.context = filename,
 		.fetchFunction = &ld_store_cdc_filename_fetch
 	};
 
@@ -312,6 +328,36 @@ ld_store_set_current_cdc_filename(StreamSpecs *specs)
 	if (!catalog_sql_execute_once(&query))
 	{
 		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * ld_store_check_current_cdc_filename returns false when the output.db that
+ * receive has open is not the open output.db of cdc_files.  Apply only reads
+ * the files of cdc_files, in order, and receive reports what it spools as
+ * flushed to the source, so spooling anywhere else loses those transactions.
+ */
+bool
+ld_store_check_current_cdc_filename(StreamSpecs *specs)
+{
+	char current[MAXPGPATH] = { 0 };
+
+	if (!ld_store_fetch_current_cdc_filename(specs->sourceDB, current))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!streq(current, specs->outputDB->dbfile))
+	{
+		log_error("Refusing to spool changes into output CDC file \"%s\": "
+				  "the open output CDC file in cdc_files is \"%s\"",
+				  specs->outputDB->dbfile,
+				  IS_EMPTY_STRING_BUFFER(current) ? "(none)" : current);
 		return false;
 	}
 
@@ -1277,6 +1323,41 @@ ld_store_rotate_outputdb(StreamSpecs *specs, uint64_t commit_lsn)
 
 
 /*
+ * ld_store_remove_sqlite_file removes an output.db or replay.db file together
+ * with its -wal and -shm files.  Removing only the main file leaves its -wal
+ * behind: committed pages that were never checkpointed are then split from
+ * their database, and a later SQLite connection to the same name finds a -wal
+ * that does not belong to it.  The given catalog is closed first when it
+ * still has that file open, so that no connection of this process holds it.
+ */
+static bool
+ld_store_remove_sqlite_file(DatabaseCatalog *catalog, const char *dbfile)
+{
+	if (catalog != NULL && catalog->db != NULL && streq(catalog->dbfile, dbfile))
+	{
+		if (!catalog_close(catalog))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+	}
+
+	bool success = unlink_file(dbfile);
+	const char *suffixes[] = { "-wal", "-shm" };
+
+	for (int i = 0; i < 2; i++)
+	{
+		char path[MAXPGPATH] = { 0 };
+
+		sformat(path, sizeof(path), "%s%s", dbfile, suffixes[i]);
+		success = unlink_file(path) && success;
+	}
+
+	return success;
+}
+
+
+/*
  * ld_store_cleanup_cdc_files removes output.db/replay.db file pairs that
  * have been fully applied to the target.  A pair is safe to delete when its
  * endpos is strictly less than sentinel.replay_lsn AND done_time_epoch is set
@@ -1449,26 +1530,25 @@ ld_store_cleanup_cdc_files(StreamSpecs *specs,
 			continue;
 		}
 
-		/* remove output.db */
-		if (unlink_file(rows[i].filename))
+		/* remove output.db and replay.db, with their -wal and -shm files */
+		if (ld_store_remove_sqlite_file(specs->outputDB, rows[i].filename))
 		{
 			log_info("Removed CDC output file: %s", rows[i].filename);
 		}
 		else
 		{
-			/* file missing on disk is not fatal — catalog entry still needs removal */
-			log_warn("CDC output file not found on disk, removing catalog entry: %s",
+			/* not fatal — catalog entry still needs removal */
+			log_warn("Failed to remove CDC output file, removing catalog entry: %s",
 					 rows[i].filename);
 		}
 
-		/* remove replay.db */
-		if (unlink_file(replayFile))
+		if (ld_store_remove_sqlite_file(specs->replayDB, replayFile))
 		{
 			log_info("Removed CDC replay file: %s", replayFile);
 		}
 		else
 		{
-			log_warn("CDC replay file not found on disk, removing catalog entry: %s",
+			log_warn("Failed to remove CDC replay file, removing catalog entry: %s",
 					 replayFile);
 		}
 

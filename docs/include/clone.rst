@@ -43,6 +43,7 @@
      --enable-failover             Create the replication slot with FAILOVER (Postgres 17+)
      --max-restarts <n>            Restart failed follow sub-processes at most n times (default 5)
      --restart-window <seconds>    ... within this many seconds (default 300)
+     --max-replaydb-size <size>    Rotate CDC files at this size (default 1GB)
      --origin                      Use this Postgres replication origin node name
      --endpos                      Stop replaying changes when reaching this LSN
      --use-copy-binary             Use the COPY BINARY format for COPY operations

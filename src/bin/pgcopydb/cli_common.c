@@ -757,6 +757,7 @@ cli_copy_db_getopts(int argc, char **argv)
 		{ "enable-failover", no_argument, NULL, 1006 },
 		{ "max-restarts", required_argument, NULL, 1007 },
 		{ "restart-window", required_argument, NULL, 1008 },
+		{ "max-replaydb-size", required_argument, NULL, 1009 },
 		{ "host", required_argument, NULL, 1001 },
 		{ "port", required_argument, NULL, 1002 },
 		{ "version", no_argument, NULL, 'V' },
@@ -1186,6 +1187,21 @@ cli_copy_db_getopts(int argc, char **argv)
 					++errors;
 				}
 				log_trace("--restart-window %d", options.restartWindow);
+				break;
+			}
+
+			case 1009:      /* --max-replaydb-size */
+			{
+				if (!parse_pretty_printed_bytes(optarg,
+												&(options.maxReplayDBSize)))
+				{
+					log_fatal("Failed to parse --max-replaydb-size \"%s\"",
+							  optarg);
+					++errors;
+				}
+
+				log_trace("--max-replaydb-size %llu",
+						  (unsigned long long) options.maxReplayDBSize);
 				break;
 			}
 
