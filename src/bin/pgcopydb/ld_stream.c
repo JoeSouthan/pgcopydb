@@ -638,6 +638,12 @@ stream_init_timeline(StreamSpecs *specs, LogicalStreamClient *stream)
 		return false;
 	}
 
+	if (!ld_store_check_current_cdc_filename(specs))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
 	return true;
 }
 
@@ -659,6 +665,16 @@ startLogicalStreaming(StreamSpecs *specs)
 	stream.feedbackFunction = &streamFeedback;
 	stream.keepaliveFunction = &streamKeepalive;
 	stream.idleFunction = &streamIdle;
+
+	/*
+	 * Receive spools into the open output.db of cdc_files: look it up rather
+	 * than trust a name inherited across fork() from a process that opened an
+	 * output.db before receive rotated away from it.
+	 */
+	if (specs->outputDB->db == NULL)
+	{
+		memset(specs->outputDB->dbfile, 0, sizeof(specs->outputDB->dbfile));
+	}
 
 	/*
 	 * Read possibly already existing file to initialize the start LSN from a

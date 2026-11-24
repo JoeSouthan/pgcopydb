@@ -62,6 +62,7 @@ bool ld_store_open_replaydb(StreamSpecs *specs);
 
 bool ld_store_set_first_cdc_filename(StreamSpecs *specs);
 bool ld_store_set_current_cdc_filename(StreamSpecs *specs);
+bool ld_store_check_current_cdc_filename(StreamSpecs *specs);
 bool ld_store_set_cdc_filename_at_lsn(StreamSpecs *specs, uint64_t lsn);
 
 bool ld_store_cdc_filename_fetch(SQLiteQuery *query);
