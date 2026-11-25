@@ -350,6 +350,8 @@ typedef struct CatalogSetup
 	uint64_t splitTablesLargerThanBytes;
 	int splitMaxParts;
 	char *filters;              /* malloc'ed area */
+	bool deferValidateFKs;      /* --defer-validate-fks, checked on resume */
+	bool deferValidateFKsSet;   /* false when no owner command has claimed it */
 } CatalogSetup;
 
 typedef enum

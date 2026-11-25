@@ -50,6 +50,7 @@
 	"  --skip-ext-comments           Skip restoring COMMENT ON EXTENSION\n" \
 	"  --skip-collations             Skip restoring collations\n" \
 	"  --skip-vacuum                 Skip running VACUUM ANALYZE\n" \
+	"  --defer-validate-fks          Create foreign keys NOT VALID and validate them after CDC apply starts\n" \
 	"  --skip-analyze                Skip running vacuumdb --analyze-only\n" \
 	"  --skip-db-properties          Skip copying ALTER DATABASE SET properties\n" \
 	"  --skip-split-by-ctid          Skip spliting tables by ctid\n" \
@@ -497,6 +498,8 @@ void
 cli_clone(int argc, char **argv)
 {
 	CopyDataSpec copySpecs = { 0 };
+
+	copyDBoptions.ownsDeferValidateFKs = true;
 
 	(void) cli_copy_prepare_specs(&copySpecs, DATA_SECTION_ALL);
 

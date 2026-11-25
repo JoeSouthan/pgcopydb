@@ -29,6 +29,9 @@
 #include "summary.h"
 
 
+static bool catalog_upgrade_source_schema(DatabaseCatalog *catalog);
+
+
 /*
  * pgcopydb catalog cache is a SQLite database with the following schema:
  */
@@ -52,6 +55,32 @@
  * This is critical for INSERT OR IGNORE / INSERT OR REPLACE semantics: SQLite
  * needs the unique index present at insert time to suppress duplicates.
  */
+/*
+ * Foreign keys, used by --defer-validate-fks. conname and qname are stored
+ * already quoted for use in DDL. The tables are also added to the catalogs of
+ * older pgcopydb versions, see catalog_upgrade_source_schema.
+ */
+#define S_FK_CONSTRAINT_DDL \
+	"create table if not exists s_fk_constraint(" \
+	"  oid integer primary key, conname text, nspname text, relname text, " \
+	"  qname text, reloid integer, condeferrable bool, condeferred bool, " \
+	"  convalidated bool, constraintdef text" \
+	")"
+
+#define FK_CONSTRAINT_SUMMARY_DDL \
+	"create table if not exists fk_constraint_summary(" \
+	"  conoid integer primary key references s_fk_constraint(oid), " \
+	"  pid integer, start_time_epoch integer, done_time_epoch integer, " \
+	"  duration integer, status text, command text" \
+	")"
+
+#define FK_VALIDATION_SUMMARY_DDL \
+	"create table if not exists fk_validation_summary(" \
+	"  conoid integer primary key references s_fk_constraint(oid), " \
+	"  pid integer, start_time_epoch integer, done_time_epoch integer, " \
+	"  duration integer, status text, error text" \
+	")"
+
 static char *sourceDBcreateTableDDLs[] = {
 	/*
 	 * filters: JSON representation of the parsed SourceFilters struct,
@@ -64,7 +93,8 @@ static char *sourceDBcreateTableDDLs[] = {
 	"  snapshot text, "
 	"  split_tables_larger_than integer, "
 	"  split_max_parts integer, "
-	"  filters text"
+	"  filters text, "
+	"  defer_validate_fks integer"
 	")",
 
 	/*
@@ -164,6 +194,11 @@ static char *sourceDBcreateTableDDLs[] = {
 	"  last_value integer, isCalled bool, "
 	"  primary key(oid, ownedby, attrelid, attroid)"
 	")",
+
+	/* foreign keys, used by --defer-validate-fks */
+	S_FK_CONSTRAINT_DDL,
+	FK_CONSTRAINT_SUMMARY_DDL,
+	FK_VALIDATION_SUMMARY_DDL,
 
 	/* internal activity tracking / completion / statistics */
 	"create table process("
@@ -969,7 +1004,9 @@ catalog_register_setup_from_specs(CopyDataSpec *copySpecs)
 									snapStr,
 									copySpecs->splitTablesLargerThan.bytes,
 									copySpecs->splitMaxParts,
-									filterJson))
+									filterJson,
+									copySpecs->ownsDeferValidateFKs,
+									copySpecs->deferValidateFKs))
 		{
 			/* errors have already been logged */
 			json_free_serialized_string(json);
@@ -985,6 +1022,44 @@ catalog_register_setup_from_specs(CopyDataSpec *copySpecs)
 				  setup->source_pguri,
 				  setup->target_pguri,
 				  setup->snapshot);
+
+		/*
+		 * --defer-validate-fks must not change across a resume: dropping it
+		 * would create the remaining foreign keys VALID, with the validation
+		 * scan the flag exists to avoid, and adding it would leave earlier
+		 * ones validated. Only pgcopydb clone owns the flag, other commands
+		 * never store nor compare it.
+		 *
+		 * A catalog registered by another command stores NULL, "no owner has
+		 * claimed the flag yet": the first clone records its value instead
+		 * of comparing.
+		 */
+		if (copySpecs->ownsDeferValidateFKs && !setup->deferValidateFKsSet)
+		{
+			if (!catalog_update_defer_validate_fks(sourceDB,
+												   copySpecs->deferValidateFKs))
+			{
+				/* errors have already been logged */
+				json_free_serialized_string(json);
+				return false;
+			}
+
+			setup->deferValidateFKs = copySpecs->deferValidateFKs;
+			setup->deferValidateFKsSet = true;
+		}
+		else if (copySpecs->ownsDeferValidateFKs &&
+				 copySpecs->deferValidateFKs != setup->deferValidateFKs)
+		{
+			log_error("Catalogs at \"%s\" have been setup with "
+					  "--defer-validate-fks %s and current run uses %s; "
+					  "resume with the same flag value",
+					  sourceDB->dbfile,
+					  setup->deferValidateFKs ? "enabled" : "disabled",
+					  copySpecs->deferValidateFKs ? "enabled" : "disabled");
+
+			json_free_serialized_string(json);
+			return false;
+		}
 
 		if (!streq(spguri.pguri, setup->source_pguri))
 		{
@@ -1605,6 +1680,15 @@ catalog_init(DatabaseCatalog *catalog)
 		return true;
 	}
 
+	if (catalog->type == DATABASE_CATALOG_TYPE_SOURCE &&
+		!catalog_upgrade_source_schema(catalog))
+	{
+		/* errors have already been logged */
+		sqlite3_close(catalog->db);
+		catalog->db = NULL;
+		return false;
+	}
+
 	return true;
 }
 
@@ -2175,6 +2259,127 @@ catalog_upgrade_output_schema(DatabaseCatalog *catalog)
 
 
 /*
+ * catalog_source_lacks_fk_schema sets lacksColumn and lacksTables when a
+ * source catalog predates the --defer-validate-fks column and tables. A
+ * catalog without a setup table is still being created, and lacks nothing.
+ */
+static bool
+catalog_source_lacks_fk_schema(DatabaseCatalog *catalog,
+							   bool *lacksColumn,
+							   bool *lacksTables)
+{
+	char *sql =
+		"with t(name) as (select name from sqlite_master where type = 'table') "
+		"select exists(select 1 from t where name = 'setup') "
+		"   and not exists(select 1 from pragma_table_info('setup') "
+		"                   where name = 'defer_validate_fks'), "
+		"       exists(select 1 from t where name = 'setup') "
+		"   and not exists(select 1 from t "
+		"                   where name = 'fk_validation_summary')";
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(catalog->db, sql, &query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (catalog_sql_step(&query) != SQLITE_ROW)
+	{
+		log_error("Failed to check the setup table of \"%s\": %s",
+				  catalog->dbfile,
+				  sqlite3_errmsg(catalog->db));
+		(void) catalog_sql_finalize(&query);
+		return false;
+	}
+
+	*lacksColumn = sqlite3_column_int(query.ppStmt, 0) == 1;
+	*lacksTables = sqlite3_column_int(query.ppStmt, 1) == 1;
+
+	return catalog_sql_finalize(&query);
+}
+
+
+/*
+ * catalog_upgrade_source_schema adds the --defer-validate-fks column and
+ * tables to a source catalog written by an older pgcopydb, so that every
+ * command can use it. The column is left NULL: no clone has claimed the flag.
+ */
+static bool
+catalog_upgrade_source_schema(DatabaseCatalog *catalog)
+{
+	bool lacksColumn = false;
+	bool lacksTables = false;
+
+	/* the common case only reads the schema, and takes no lock */
+	if (!catalog_source_lacks_fk_schema(catalog, &lacksColumn, &lacksTables))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!lacksColumn && !lacksTables)
+	{
+		return true;
+	}
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!catalog_begin(catalog, true))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	char *ddls[] = {
+		S_FK_CONSTRAINT_DDL,
+		FK_CONSTRAINT_SUMMARY_DDL,
+		FK_VALIDATION_SUMMARY_DDL
+	};
+
+	/* another process might have upgraded the catalog in the meantime */
+	bool success =
+		catalog_source_lacks_fk_schema(catalog, &lacksColumn, &lacksTables);
+
+	if (success && lacksColumn)
+	{
+		log_notice("Adding column setup.defer_validate_fks to \"%s\"",
+				   catalog->dbfile);
+
+		success = catalog_execute(catalog,
+								  "alter table setup "
+								  "add column defer_validate_fks integer");
+	}
+
+	int count = sizeof(ddls) / sizeof(ddls[0]);
+
+	for (int i = 0; success && lacksTables && i < count; i++)
+	{
+		success = catalog_execute(catalog, ddls[i]);
+	}
+
+	if (success)
+	{
+		success = catalog_commit(catalog);
+	}
+	else
+	{
+		(void) catalog_execute(catalog, "ROLLBACK");
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return success;
+}
+
+
+/*
  * catalog_in_transaction returns true when a transaction opened with
  * catalog_begin is still open on the catalog.
  */
@@ -2205,7 +2410,9 @@ catalog_register_setup(DatabaseCatalog *catalog,
 					   const char *snapshot,
 					   uint64_t splitTablesLargerThanBytes,
 					   int splitMaxParts,
-					   const char *filters)
+					   const char *filters,
+					   bool claimDeferValidateFKs,
+					   bool deferValidateFKs)
 {
 	sqlite3 *db = catalog->db;
 
@@ -2218,8 +2425,8 @@ catalog_register_setup(DatabaseCatalog *catalog,
 	char *sql =
 		"insert into setup("
 		"  id, source_pg_uri, target_pg_uri, snapshot, filters, "
-		"  split_tables_larger_than, split_max_parts) "
-		"values($1, $2, $3, $4, $5, $6, $7)";
+		"  defer_validate_fks, split_tables_larger_than, split_max_parts) "
+		"values($1, $2, $3, $4, $5, $6, $7, $8)";
 
 	SQLiteQuery query = { 0 };
 
@@ -2229,6 +2436,14 @@ catalog_register_setup(DatabaseCatalog *catalog,
 		{ BIND_PARAMETER_TYPE_TEXT, "target_pg_uri", 0, (char *) target_pg_uri },
 		{ BIND_PARAMETER_TYPE_TEXT, "snapshot", 0, (char *) snapshot },
 		{ BIND_PARAMETER_TYPE_TEXT, "filters", 0, (char *) filters },
+
+		/* before the split columns: count trimming below drops the tail */
+		{
+			claimDeferValidateFKs
+			? BIND_PARAMETER_TYPE_INT : BIND_PARAMETER_TYPE_TEXT,
+			"defer_validate_fks",
+			deferValidateFKs ? 1 : 0, NULL
+		},
 
 		{
 			BIND_PARAMETER_TYPE_INT64, "split_tables_larger_than",
@@ -2253,8 +2468,9 @@ catalog_register_setup(DatabaseCatalog *catalog,
 	{
 		sql =
 			"insert into setup("
-			"  id, source_pg_uri, target_pg_uri, snapshot, filters) "
-			"values($1, $2, $3, $4, $5)";
+			"  id, source_pg_uri, target_pg_uri, snapshot, filters, "
+			"  defer_validate_fks) "
+			"values($1, $2, $3, $4, $5, $6)";
 
 		count -= 2;
 	}
@@ -2263,8 +2479,8 @@ catalog_register_setup(DatabaseCatalog *catalog,
 		sql =
 			"insert into setup("
 			"  id, source_pg_uri, target_pg_uri, snapshot, filters, "
-			"  split_tables_larger_than) "
-			"values($1, $2, $3, $4, $5, $6)";
+			"  defer_validate_fks, split_tables_larger_than) "
+			"values($1, $2, $3, $4, $5, $6, $7)";
 
 		--count;
 	}
@@ -2318,6 +2534,8 @@ catalog_setup(DatabaseCatalog *catalog)
 	catalog->setup.filters = NULL;
 	catalog->setup.splitTablesLargerThanBytes = 0;
 	catalog->setup.splitMaxParts = 0;
+	catalog->setup.deferValidateFKs = false;
+	catalog->setup.deferValidateFKsSet = false;
 
 	SQLiteQuery query = {
 		.context = &(catalog->setup),
@@ -2326,7 +2544,8 @@ catalog_setup(DatabaseCatalog *catalog)
 
 	char *sql =
 		"select id, source_pg_uri, target_pg_uri, snapshot, "
-		"       split_tables_larger_than, split_max_parts, filters "
+		"       split_tables_larger_than, split_max_parts, filters, "
+		"       defer_validate_fks "
 		"from setup";
 
 	if (!semaphore_lock(&(catalog->sema)))
@@ -2497,6 +2716,71 @@ catalog_update_filters(DatabaseCatalog *catalog, const char *filters)
 
 
 /*
+ * catalog_update_defer_validate_fks records the --defer-validate-fks value in
+ * the setup table, for a catalog registered before any owner command ran.
+ */
+bool
+catalog_update_defer_validate_fks(DatabaseCatalog *catalog,
+								  bool deferValidateFKs)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_update_defer_validate_fks: db is NULL");
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	char *sql =
+		"update setup "
+		"   set defer_validate_fks = $1 "
+		" where id = 1";
+
+	BindParam params[] = {
+		{
+			BIND_PARAMETER_TYPE_INT, "defer_validate_fks",
+			deferValidateFKs ? 1 : 0, NULL
+		}
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
  * catalog_section_fetch is a SQLiteQuery callback.
  */
 bool
@@ -2599,6 +2883,14 @@ catalog_setup_fetch(SQLiteQuery *query)
 				(char *) sqlite3_column_text(query->ppStmt, 6),
 				bytes);
 	}
+
+	/* defer_validate_fks is NULL until an owner command claims it */
+	setup->deferValidateFKsSet =
+		sqlite3_column_type(query->ppStmt, 7) != SQLITE_NULL;
+
+	setup->deferValidateFKs =
+		setup->deferValidateFKsSet &&
+		sqlite3_column_int(query->ppStmt, 7) == 1;
 
 	return true;
 }

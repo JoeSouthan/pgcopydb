@@ -143,6 +143,7 @@ jobs:
           - cdc-concurrent-backlog
           - cdc-copy-multi-insert
           - cdc-origin-abort
+          - defer-validate-fks
           - follow-restart-rotation
           - cdc-interleaved-commits
           - cdc-commit-order-resume
@@ -197,6 +198,8 @@ jobs:
           - TEST: cdc-concurrent-backlog
             PGVERSION: 16
           - TEST: cdc-origin-abort
+            PGVERSION: 16
+          - TEST: defer-validate-fks
             PGVERSION: 16
     steps:
       - name: Checkout repository

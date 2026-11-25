@@ -266,6 +266,10 @@ cli_copydb_getenv(CopyDBOptions *options)
 			&(options->skipVacuum)
 		},
 		{
+			PGCOPYDB_DEFER_VALIDATE_FKS, ENV_TYPE_BOOL,
+			&(options->deferValidateFKs)
+		},
+		{
 			PGCOPYDB_SKIP_ANALYZE, ENV_TYPE_BOOL,
 			&(options->skipAnalyze)
 		},
@@ -758,6 +762,7 @@ cli_copy_db_getopts(int argc, char **argv)
 		{ "max-restarts", required_argument, NULL, 1007 },
 		{ "restart-window", required_argument, NULL, 1008 },
 		{ "max-replaydb-size", required_argument, NULL, 1009 },
+		{ "defer-validate-fks", no_argument, NULL, 1010 },
 		{ "host", required_argument, NULL, 1001 },
 		{ "port", required_argument, NULL, 1002 },
 		{ "version", no_argument, NULL, 'V' },
@@ -1205,6 +1210,14 @@ cli_copy_db_getopts(int argc, char **argv)
 				break;
 			}
 
+			case 1010:      /* --defer-validate-fks */
+			{
+				options.deferValidateFKs = true;
+				options.deferValidateFKsOnCommandLine = true;
+				log_trace("--defer-validate-fks");
+				break;
+			}
+
 			case 1001:      /* --host: follow coordinator TCP listen host */
 			{
 				strlcpy(options.host, optarg, sizeof(options.host));
@@ -1342,6 +1355,13 @@ cli_copy_db_getopts(int argc, char **argv)
 		exit(EXIT_CODE_BAD_ARGS);
 	}
 
+	if (options.deferValidateFKs && options.allDatabases)
+	{
+		log_fatal("Option --defer-validate-fks is not supported "
+				  "with --all-databases");
+		exit(EXIT_CODE_BAD_ARGS);
+	}
+
 	if (options.slot.wal2jsonNumericAsString &&
 		options.slot.plugin != STREAM_PLUGIN_WAL2JSON)
 	{
@@ -1444,6 +1464,14 @@ void
 cli_copy_prepare_specs(CopyDataSpec *copySpecs, CopyDataSection section)
 {
 	PostgresPaths *pgPaths = &(copySpecs->pgPaths);
+
+	if (copyDBoptions.deferValidateFKsOnCommandLine &&
+		!copyDBoptions.ownsDeferValidateFKs)
+	{
+		log_fatal("Option --defer-validate-fks is only supported "
+				  "by the clone command");
+		exit(EXIT_CODE_BAD_ARGS);
+	}
 
 	char *safeSourceURI = copyDBoptions.connStrings.safeSourcePGURI.pguri;
 	char *safeTargetURI = copyDBoptions.connStrings.safeTargetPGURI.pguri;

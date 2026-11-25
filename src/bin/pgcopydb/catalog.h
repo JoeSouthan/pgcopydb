@@ -72,7 +72,12 @@ bool catalog_register_setup(DatabaseCatalog *catalog,
 							const char *snapshot,
 							uint64_t splitTablesLargerThanBytes,
 							int splitMaxParts,
-							const char *filters);
+							const char *filters,
+							bool claimDeferValidateFKs,
+							bool deferValidateFKs);
+
+bool catalog_update_defer_validate_fks(DatabaseCatalog *catalog,
+									   bool deferValidateFKs);
 
 bool catalog_setup_replication(DatabaseCatalog *catalog, const char *snapshot);
 

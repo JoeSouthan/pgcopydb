@@ -66,6 +66,9 @@ typedef struct CopyDBOptions
 	bool skipCommentOnExtension;
 	bool skipCollations;
 	bool skipVacuum;
+	bool deferValidateFKs;
+	bool deferValidateFKsOnCommandLine;
+	bool ownsDeferValidateFKs;
 	bool skipAnalyze;
 	bool skipDBproperties;
 	bool skipCtidSplit;

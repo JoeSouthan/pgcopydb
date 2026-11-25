@@ -297,6 +297,10 @@ typedef struct CopyDataSpec
 	bool skipCommentOnExtension;
 	bool skipCollations;
 	bool skipVacuum;
+	bool deferValidateFKs;
+
+	/* only pgcopydb clone owns --defer-validate-fks: stores and checks it */
+	bool ownsDeferValidateFKs;
 	bool skipAnalyze;
 	bool skipDBproperties;
 	bool skipCtidSplit;
