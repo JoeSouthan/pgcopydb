@@ -29,6 +29,7 @@ bool pgcopydb_sql_list_source_tables(const char **sql);
 bool pgcopydb_sql_list_filtered_not_incl_tables(const char **sql);
 bool pgcopydb_sql_list_filtered_excl_tables(const char **sql);
 bool pgcopydb_sql_list_source_indexes(const char **sql);
+bool pgcopydb_sql_list_source_fk_constraints(const char **sql);
 bool pgcopydb_sql_list_source_sequences(const char **sql);
 bool pgcopydb_sql_list_source_depend(const char **sql);
 bool pgcopydb_sql_list_source_table_size(const char **sql);

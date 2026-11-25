@@ -619,6 +619,12 @@ copydb_target_finalize_schema(CopyDataSpec *specs)
 		return false;
 	}
 
+	if (specs->deferValidateFKs && !copydb_create_fk_constraints(specs))
+	{
+		log_error("Failed to create the foreign keys, see above for details");
+		return false;
+	}
+
 	/*
 	 * Some extensions such as timescaledb need a post restore step.
 	 */
@@ -932,6 +938,35 @@ copydb_write_restore_list_hook(void *ctx, ArchiveContentItem *item)
 	if (!skip && context->schemasOnly && catOid != PG_NAMESPACE_OID)
 	{
 		skip = true;
+	}
+
+	/*
+	 * With --defer-validate-fks the foreign keys that we listed in scope are
+	 * created by pgcopydb itself, as NOT VALID, once pg_restore is done. Any
+	 * other foreign key is left to pg_restore and the filters below, as
+	 * without the option, so that none is lost silently.
+	 */
+	if (!skip &&
+		specs->deferValidateFKs &&
+		item->desc == ARCHIVE_TAG_FK_CONSTRAINT)
+	{
+		SourceFKConstraint fk = { 0 };
+
+		if (!catalog_lookup_s_fk_constraint_by_oid(&(specs->catalogs.source),
+												   &fk,
+												   oid))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		if (fk.oid == oid && fk.inScope)
+		{
+			skip = true;
+			log_debug("Skipping FK CONSTRAINT \"%s\"", name);
+		}
+
+		free(fk.constraintDef);
 	}
 
 	/*

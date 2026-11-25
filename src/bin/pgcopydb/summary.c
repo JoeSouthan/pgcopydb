@@ -1677,6 +1677,224 @@ summary_finish_constraint(DatabaseCatalog *catalog, CopyIndexSpec *indexSpecs)
 
 
 /*
+ * summary_lookup_fk_constraint looks-up an fk_constraint_summary entry in
+ * our catalogs, in case the foreign key has already been handled in a previous
+ * run.
+ */
+bool
+summary_lookup_fk_constraint(DatabaseCatalog *catalog,
+							 uint32_t conoid,
+							 bool *done)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_lookup_fk_constraint: db is NULL");
+		return false;
+	}
+
+	*done = false;
+
+	char *sql =
+		"  select done_time_epoch "
+		"    from fk_constraint_summary "
+		"   where conoid = $1";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "conoid", conoid, NULL }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	int rc = catalog_sql_step(&query);
+
+	if (rc != SQLITE_ROW && rc != SQLITE_DONE)
+	{
+		log_error("Failed to step through statement: %s", query.sql);
+		log_error("[SQLite] %s", sqlite3_errmsg(query.db));
+		(void) catalog_sql_finalize(&query);
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	if (rc == SQLITE_ROW)
+	{
+		*done = sqlite3_column_type(query.ppStmt, 0) != SQLITE_NULL;
+	}
+
+	if (!catalog_sql_finalize(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * summary_add_fk_constraint INSERTs a foreign key summary entry in our
+ * catalogs, when starting to create the constraint. A previous attempt that
+ * did not finish is replaced.
+ */
+bool
+summary_add_fk_constraint(DatabaseCatalog *catalog,
+						  SourceFKConstraint *fk,
+						  const char *command)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_add_fk_constraint: db is NULL");
+		return false;
+	}
+
+	char *sql =
+		"insert or replace into fk_constraint_summary"
+		"  (conoid, pid, start_time_epoch, command) "
+		"values($1, $2, $3, $4)";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "conoid", fk->oid, NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "pid", getpid(), NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "start_time_epoch", time(NULL), NULL },
+		{ BIND_PARAMETER_TYPE_TEXT, "command", 0, (char *) command }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * summary_finish_fk_constraint UPDATEs a foreign key summary entry in our
+ * catalogs with its duration and final status.
+ */
+bool
+summary_finish_fk_constraint(DatabaseCatalog *catalog,
+							 SourceFKConstraint *fk,
+							 uint64_t durationMs,
+							 const char *status)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_finish_fk_constraint: db is NULL");
+		return false;
+	}
+
+	char *sql =
+		"update fk_constraint_summary "
+		"   set done_time_epoch = $1, duration = $2, status = $3 "
+		" where conoid = $4";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "done_time_epoch", time(NULL), NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "duration", durationMs, NULL },
+		{ BIND_PARAMETER_TYPE_TEXT, "status", 0, (char *) status },
+		{ BIND_PARAMETER_TYPE_INT64, "conoid", fk->oid, NULL }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
  * summary_lookup_extension looks-up an extension summary in our catalogs, in
  * case the given extension has already been done in a previous run.
  */

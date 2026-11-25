@@ -461,6 +461,10 @@ bool copydb_table_indexes_are_done(CopyDataSpec *specs,
 								   bool *constraintsAreBeingBuilt);
 
 bool copydb_copy_all_indexes(CopyDataSpec *specs);
+bool copydb_create_fk_constraints(CopyDataSpec *specs);
+
+/* section name in the catalog for the foreign keys, see copydb_schema.c */
+#define FK_CONSTRAINTS_SECTION "fk-constraints"
 
 bool copydb_create_index(CopyDataSpec *specs,
 						 PGSQL *dst,
@@ -710,6 +714,19 @@ bool summary_add_index(DatabaseCatalog *catalog,
 
 bool summary_finish_index(DatabaseCatalog *catalog,
 						  CopyIndexSpec *indexSpecs);
+
+bool summary_lookup_fk_constraint(DatabaseCatalog *catalog,
+								  uint32_t conoid,
+								  bool *done);
+
+bool summary_add_fk_constraint(DatabaseCatalog *catalog,
+							   SourceFKConstraint *fk,
+							   const char *command);
+
+bool summary_finish_fk_constraint(DatabaseCatalog *catalog,
+								  SourceFKConstraint *fk,
+								  uint64_t durationMs,
+								  const char *status);
 
 bool summary_delete_index(DatabaseCatalog *catalog,
 						  CopyIndexSpec *indexSpecs);

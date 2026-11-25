@@ -122,6 +122,14 @@ pgcopydb_sql_list_source_indexes(const char **sql)
 
 
 bool
+pgcopydb_sql_list_source_fk_constraints(const char **sql)
+{
+	*sql = sql_list_source_fk_constraints;
+	return true;
+}
+
+
+bool
 pgcopydb_sql_list_source_sequences(const char **sql)
 {
 	*sql = sql_list_source_sequences;
