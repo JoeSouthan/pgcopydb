@@ -115,7 +115,10 @@ typedef enum
 	TIMING_SECTION_SET_SEQUENCES,
 	TIMING_SECTION_LARGE_OBJECTS,
 	TIMING_SECTION_FINALIZE_SCHEMA,
-	TIMING_SECTION_TOTAL
+	TIMING_SECTION_TOTAL,
+
+	/* appended after TOTAL so that the on-disk ids above do not change */
+	TIMING_SECTION_VALIDATE_FKS
 } TimingSection;
 
 #define TIMING_SINGLE_JOB 1
@@ -462,6 +465,17 @@ bool catalog_iter_s_fk_constraint_next(SourceFKConstraintIterator *iter);
 bool catalog_iter_s_fk_constraint_finish(SourceFKConstraintIterator *iter);
 
 bool catalog_s_fk_constraint_fetch(SQLiteQuery *query);
+
+bool catalog_count_fk_validation(DatabaseCatalog *catalog, int *pending, int *failed);
+
+bool catalog_list_fk_validation_pending_tables(DatabaseCatalog *catalog,
+											   uint32_t **reloids,
+											   int *count);
+
+bool catalog_list_fk_validation_pending_by_table(DatabaseCatalog *catalog,
+												 uint32_t reloid,
+												 uint32_t **oids,
+												 int *count);
 
 /*
  * Sequences

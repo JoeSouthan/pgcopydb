@@ -612,6 +612,36 @@ The following options are available to ``pgcopydb clone``:
   Skip running VACUUM ANALYZE on the target database once a table has been
   copied, its indexes have been created, and constraints installed.
 
+--defer-validate-fks
+
+  Create the foreign keys NOT VALID in the post-data step, rather than have
+  pg_restore create and validate them, then validate them with ``ALTER TABLE
+  ... VALIDATE CONSTRAINT`` once the clone is done and the source snapshot is
+  released. With ``--follow`` the validations run while the changes are
+  applied, and a validation that fails is recorded and logged but never
+  stops the follow process. A resumed run validates the foreign keys that
+  are still pending or have failed. The option is only supported by the
+  clone command, and must be the same when resuming.
+
+  As many as ``--index-jobs`` validation processes run alongside the apply
+  process, each validating the foreign keys of one table at a time. Postgres
+  runs the validation query of each of them with ``work_mem`` set to
+  ``maintenance_work_mem``, which pgcopydb sets to 1 GB on the target.
+
+  Foreign keys that are not valid on the source are created NOT VALID and are
+  not validated. A foreign key that references a table that is not part of
+  the copy is left to pg_restore and the filters, as without this option.
+
+  A foreign key declared on a partitioned table fails the post-data step. So
+  does a foreign key of a partitioned table that is excluded by name while
+  some of its partitions are part of the copy.
+
+  ``pgcopydb clone`` and ``pgcopydb clone --follow`` exit with a non-zero
+  exit code when some foreign keys are left NOT VALID, because they failed to
+  validate or are still pending, so that the command does not look
+  successful. With ``--follow``, this is checked only once the follow
+  process is done.
+
 --skip-analyze
 
   Skip running ``vacuumdb --analyze-only`` on the source database to update

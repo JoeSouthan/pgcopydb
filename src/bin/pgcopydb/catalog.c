@@ -7567,6 +7567,249 @@ catalog_iter_s_fk_constraint_finish(SourceFKConstraintIterator *iter)
 
 
 /*
+ * The deferred foreign keys left to validate: created NOT VALID by pgcopydb,
+ * and not validated yet. A failed validation is still pending.
+ */
+#define FK_VALIDATION_PENDING \
+	"     from fk_constraint_summary s " \
+	"          join s_fk_constraint f on f.oid = s.conoid " \
+	"          left join fk_validation_summary v on v.conoid = s.conoid " \
+	"    where s.status = 'created' " \
+	"      and (v.status is null or v.status <> 'validated') "
+
+
+typedef struct FKValidationCounts
+{
+	int pending;
+	int failed;
+} FKValidationCounts;
+
+
+/*
+ * catalog_count_fk_validation_fetch fetches the counts of the deferred
+ * foreign keys left to validate, and of those that failed to validate.
+ */
+static bool
+catalog_count_fk_validation_fetch(SQLiteQuery *query)
+{
+	FKValidationCounts *counts = (FKValidationCounts *) query->context;
+
+	counts->pending = sqlite3_column_int(query->ppStmt, 0);
+	counts->failed = sqlite3_column_int(query->ppStmt, 1);
+
+	return true;
+}
+
+
+/*
+ * catalog_count_fk_validation counts the deferred foreign keys that are left
+ * to validate, and the ones of those whose last validation failed.
+ */
+bool
+catalog_count_fk_validation(DatabaseCatalog *catalog, int *pending, int *failed)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_count_fk_validation: db is NULL");
+		return false;
+	}
+
+	char *sql =
+		"   select count(*), "
+		"          count(*) filter (where v.status = 'failed') "
+		FK_VALIDATION_PENDING;
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	FKValidationCounts counts = { 0 };
+
+	SQLiteQuery query = {
+		.context = &counts,
+		.fetchFunction = &catalog_count_fk_validation_fetch
+	};
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which return exactly one row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	*pending = counts.pending;
+	*failed = counts.failed;
+
+	return true;
+}
+
+
+/*
+ * catalog_list_fk_validation_oids runs the given query, which returns one OID
+ * per row, and collects the OIDs in a malloc'ed array.
+ */
+static bool
+catalog_list_fk_validation_oids(DatabaseCatalog *catalog,
+								const char *sql,
+								BindParam *params,
+								int paramCount,
+								uint32_t **oids,
+								int *count)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_list_fk_validation_oids: db is NULL");
+		return false;
+	}
+
+	*oids = NULL;
+	*count = 0;
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	if (paramCount > 0 && !catalog_sql_bind(&query, params, paramCount))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	int capacity = 0;
+	bool success = true;
+
+	for (;;)
+	{
+		int rc = catalog_sql_step(&query);
+
+		if (rc == SQLITE_DONE)
+		{
+			break;
+		}
+
+		if (rc != SQLITE_ROW)
+		{
+			log_error("Failed to step through statement: %s", query.sql);
+			log_error("[SQLite] %s", sqlite3_errmsg(query.db));
+			success = false;
+			break;
+		}
+
+		if (*count >= capacity)
+		{
+			capacity = capacity == 0 ? 16 : capacity * 2;
+
+			uint32_t *array =
+				(uint32_t *) realloc(*oids, capacity * sizeof(uint32_t));
+
+			if (array == NULL)
+			{
+				log_error(ALLOCATION_FAILED_ERROR);
+				success = false;
+				break;
+			}
+
+			*oids = array;
+		}
+
+		(*oids)[(*count)++] = sqlite3_column_int64(query.ppStmt, 0);
+	}
+
+	if (!catalog_sql_finalize(&query))
+	{
+		success = false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	if (!success)
+	{
+		free(*oids);
+		*oids = NULL;
+		*count = 0;
+	}
+
+	return success;
+}
+
+
+/*
+ * catalog_list_fk_validation_pending_tables returns in a malloc'ed array the
+ * OIDs of the tables that have deferred foreign keys left to validate, the
+ * largest tables first.
+ */
+bool
+catalog_list_fk_validation_pending_tables(DatabaseCatalog *catalog,
+										  uint32_t **reloids,
+										  int *count)
+{
+	char *sql =
+		"   select f.reloid "
+		FK_VALIDATION_PENDING
+		" group by f.reloid "
+		" order by (select bytes from s_table_size ts where ts.oid = f.reloid) "
+		"          desc nulls last, "
+		"          f.reloid";
+
+	return catalog_list_fk_validation_oids(catalog, sql, NULL, 0,
+										   reloids, count);
+}
+
+
+/*
+ * catalog_list_fk_validation_pending_by_table returns in a malloc'ed array the
+ * OIDs of the deferred foreign keys of the given table left to validate.
+ */
+bool
+catalog_list_fk_validation_pending_by_table(DatabaseCatalog *catalog,
+											uint32_t reloid,
+											uint32_t **oids,
+											int *count)
+{
+	char *sql =
+		"   select f.oid "
+		FK_VALIDATION_PENDING
+		"      and f.reloid = $1 "
+		" order by f.oid";
+
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "reloid", reloid, NULL }
+	};
+
+	return catalog_list_fk_validation_oids(catalog, sql, params, 1,
+										   oids, count);
+}
+
+
+/*
  * catalog_s_table_fetch_attrs fetches the table SourceTableAttribute array
  * from our s_attr catalog.
  */

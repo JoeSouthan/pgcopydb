@@ -266,4 +266,16 @@ bool prepare_summary_table(Summary *summary, struct CopyDataSpec *specs);
 
 int TopLevelTimingConcurrency(Summary *summary, TopLevelTiming *timing);
 
+/* validation of the foreign keys deferred with --defer-validate-fks */
+#define FK_VALIDATION_STATUS_VALIDATED "validated"
+#define FK_VALIDATION_STATUS_FAILED "failed"
+
+bool summary_start_fk_validation(DatabaseCatalog *catalog, uint32_t conoid);
+
+bool summary_finish_fk_validation(DatabaseCatalog *catalog,
+								  uint32_t conoid,
+								  uint64_t durationMs,
+								  const char *status,
+								  const char *error);
+
 #endif /* SUMMARY_H */

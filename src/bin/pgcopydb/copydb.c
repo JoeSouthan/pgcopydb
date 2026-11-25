@@ -543,6 +543,7 @@ copydb_init_specs(CopyDataSpec *specs,
 
 		.preDataQueue = { NULL, -1 },
 		.vacuumQueue = { NULL, -1 },
+		.fkValidateQueue = { NULL, -1 },
 		.indexQueue = { NULL, -1 },
 
 		.catalogs = { 0 }
@@ -593,6 +594,15 @@ copydb_init_specs(CopyDataSpec *specs,
 		if (!queue_create(&(specs->vacuumQueue), "vacuum"))
 		{
 			log_error("Failed to create the VACUUM process queue");
+			return false;
+		}
+	}
+
+	if (specs->deferValidateFKs)
+	{
+		if (!queue_create(&(specs->fkValidateQueue), "validate foreign keys"))
+		{
+			log_error("Failed to create the foreign key validation queue");
 			return false;
 		}
 	}

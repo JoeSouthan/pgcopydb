@@ -109,6 +109,12 @@ TopLevelTiming topLevelTimingArray[] = {
 		.label = "Total Wall Clock Duration",
 		.conn = "both",
 		.jobsMask = TIMING_ALL_JOBS
+	},
+	{
+		.section = TIMING_SECTION_VALIDATE_FKS,
+		.label = "Validate deferred foreign keys",
+		.conn = "target",
+		.jobsMask = TIMING_INDEX_JOBS
 	}
 };
 
@@ -1895,6 +1901,140 @@ summary_finish_fk_constraint(DatabaseCatalog *catalog,
 
 
 /*
+ * summary_start_fk_validation records in our catalogs that the validation of
+ * a deferred foreign key is running. A previous attempt is replaced.
+ */
+bool
+summary_start_fk_validation(DatabaseCatalog *catalog, uint32_t conoid)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_start_fk_validation: db is NULL");
+		return false;
+	}
+
+	char *sql =
+		"insert or replace into fk_validation_summary"
+		"  (conoid, pid, start_time_epoch, status) "
+		"values($1, $2, $3, 'running')";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "conoid", conoid, NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "pid", getpid(), NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "start_time_epoch", time(NULL), NULL }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * summary_finish_fk_validation records in our catalogs the outcome of the
+ * validation of a deferred foreign key: validated, or failed with its error.
+ */
+bool
+summary_finish_fk_validation(DatabaseCatalog *catalog,
+							 uint32_t conoid,
+							 uint64_t durationMs,
+							 const char *status,
+							 const char *error)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_finish_fk_validation: db is NULL");
+		return false;
+	}
+
+	char *sql =
+		"update fk_validation_summary "
+		"   set done_time_epoch = $1, duration = $2, status = $3, error = $4 "
+		" where conoid = $5";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "done_time_epoch", time(NULL), NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "duration", durationMs, NULL },
+		{ BIND_PARAMETER_TYPE_TEXT, "status", 0, (char *) status },
+		{ BIND_PARAMETER_TYPE_TEXT, "error", 0, (char *) error },
+		{ BIND_PARAMETER_TYPE_INT64, "conoid", conoid, NULL }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
  * summary_lookup_extension looks-up an extension summary in our catalogs, in
  * case the given extension has already been done in a previous run.
  */
@@ -3385,7 +3525,14 @@ print_toplevel_summary(Summary *summary)
 			continue;
 		}
 
-		if (i + 1 == topLevelTimingArrayCount)
+		/* foreign keys are validated after the clone, when deferred */
+		if (timing->section == TIMING_SECTION_VALIDATE_FKS &&
+			timing->startTime == 0)
+		{
+			continue;
+		}
+
+		if (timing->section == TIMING_SECTION_TOTAL)
 		{
 			fformat(stdout,
 					" %50s   %10s  %10s  %10s  %12s\n",
@@ -3525,6 +3672,12 @@ print_summary_as_json(Summary *summary, const char *filename)
 	for (int i = 0; i < topLevelTimingArrayCount; i++)
 	{
 		TopLevelTiming *timing = &(topLevelTimingArray[i]);
+
+		if (timing->section == TIMING_SECTION_VALIDATE_FKS &&
+			timing->startTime == 0)
+		{
+			continue;
+		}
 
 		JSON_Value *jsStep = json_value_init_object();
 		JSON_Object *jsStepObj = json_value_get_object(jsStep);

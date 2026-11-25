@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
+#include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -17,6 +18,7 @@
 #include "commandline.h"
 #include "env_utils.h"
 #include "file_utils.h"
+#include "fk_validate.h"
 #include "ld_stream.h"
 #include "log.h"
 #include "multi_db.h"
@@ -130,6 +132,8 @@ static bool start_follow_process(CopyDataSpec *copySpecs,
 								 pid_t *pid);
 
 static bool cli_clone_follow_wait_subprocess(const char *name, pid_t pid);
+
+static void cli_clone_exit_on_deferred_fks(CopyDataSpec *copySpecs);
 
 
 /*
@@ -452,12 +456,13 @@ cli_clone_all_databases_consolidated_summary(CopyDataSpec *copySpecs)
 	{
 		TopLevelTiming *timing = &(topLevelTimingArray[i]);
 
-		if (timing->section == TIMING_SECTION_UNKNOWN)
+		if (timing->section == TIMING_SECTION_UNKNOWN ||
+			timing->section == TIMING_SECTION_VALIDATE_FKS)
 		{
 			continue;
 		}
 
-		if (i + 1 == topLevelTimingArrayCount)
+		if (timing->section == TIMING_SECTION_TOTAL)
 		{
 			fformat(stdout, " %50s   %10s  %10s  %10s  %12s\n",
 					d50s, d10s, d10s, d10s, d12s);
@@ -592,6 +597,53 @@ cli_clone(int argc, char **argv)
 	if (!success || !allExitsAreZero)
 	{
 		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	/*
+	 * Validate the foreign keys that the clone created NOT VALID, now that
+	 * the source snapshot is released. Without --follow there is no change
+	 * data capture to keep running, so a foreign key that is left to
+	 * validate fails the clone.
+	 */
+	if (copySpecs.deferValidateFKs)
+	{
+		if (!fk_validate_supervisor(&copySpecs))
+		{
+			log_error("Failed to validate the deferred foreign keys, "
+					  "see above for details");
+			exit(EXIT_CODE_INTERNAL_ERROR);
+		}
+
+		cli_clone_exit_on_deferred_fks(&copySpecs);
+	}
+}
+
+
+/*
+ * cli_clone_exit_on_deferred_fks exits with an error when some of the foreign
+ * keys that --defer-validate-fks created NOT VALID are left to validate, so
+ * that the command does not look successful. They are retried on resume.
+ */
+static void
+cli_clone_exit_on_deferred_fks(CopyDataSpec *copySpecs)
+{
+	int pending = 0;
+	int failed = 0;
+
+	if (!fk_validate_count(copySpecs, &pending, &failed))
+	{
+		log_error("Failed to count the deferred foreign keys left to "
+				  "validate, see above for details");
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	if (pending > 0)
+	{
+		log_error("%d deferred foreign key(s) are left NOT VALID on the "
+				  "target, of which %d failed to validate, "
+				  "see above for details",
+				  pending, failed);
+		exit(EXIT_CODE_TARGET);
 	}
 }
 
@@ -758,11 +810,54 @@ clone_and_follow(CopyDataSpec *copySpecs)
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
+	/*
+	 * Validate the foreign keys that the clone created NOT VALID, now that
+	 * the source snapshot is released, while the follow process applies the
+	 * changes. A validation failure must never stop the follow process.
+	 */
+	pid_t validatePID = -1;
+
+	if (copySpecs->deferValidateFKs &&
+		!fk_validate_start_supervisor(copySpecs, &validatePID))
+	{
+		log_warn("Failed to start validating the deferred foreign keys, "
+				 "see above for details");
+	}
+
 	/* now wait until the follow process is finished, if it's been started */
 	if (followPID != -1)
 	{
 		success = success &&
 				  cli_clone_follow_wait_subprocess("follow", followPID);
+	}
+
+	/*
+	 * Then wait for the foreign key validations, before the catch-all wait
+	 * below where their failure would fail the command. When the follow
+	 * process has failed, stop them rather than keep the command running for
+	 * as long as they take: they are retried on resume.
+	 */
+	if (validatePID != -1)
+	{
+		if (!success)
+		{
+			log_warn("Stopping the foreign key validations, the follow "
+					 "process has failed");
+
+			if (kill(validatePID, SIGTERM) != 0 && errno != ESRCH)
+			{
+				log_error("Failed to signal the foreign key validation "
+						  "supervisor %d: %m",
+						  validatePID);
+			}
+		}
+
+		if (!cli_clone_follow_wait_subprocess("validate foreign keys",
+											  validatePID))
+		{
+			log_warn("Failed to validate the deferred foreign keys, "
+					 "see above for details");
+		}
 	}
 
 	/*
@@ -793,6 +888,15 @@ clone_and_follow(CopyDataSpec *copySpecs)
 	if (!success)
 	{
 		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	/*
+	 * Only now that the follow process is done, a foreign key that is left to
+	 * validate fails the command.
+	 */
+	if (copySpecs->deferValidateFKs)
+	{
+		cli_clone_exit_on_deferred_fks(copySpecs);
 	}
 }
 

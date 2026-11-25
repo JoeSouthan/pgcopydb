@@ -30,18 +30,26 @@ pgcopydb clone --resume --not-consistent --defer-validate-fks --notice
 test "$(catalog_sql 'select defer_validate_fks from setup')" = 1
 
 test "$(catalog_sql 'select count(*) from s_fk_constraint')" = 3
-test "$(catalog_sql 'select count(*) from fk_validation_summary')" = 0
 
-# the foreign keys are created NOT VALID by pgcopydb, not by pg_restore
+# the foreign keys are created NOT VALID by pgcopydb, not by pg_restore, then
+# validated at the end of the clone, but the one not valid on the source
 q() {
     psql -AtX -d "${PGCOPYDB_TARGET_PGURI}" -c "$1"
 }
 
 test "$(q "select count(*) from pg_constraint where contype = 'f'")" = 3
-test "$(q "select count(*) from pg_constraint where contype = 'f' and not convalidated")" = 3
+test "$(q "select string_agg(conname, ',' order by conname)
+             from pg_constraint
+            where contype = 'f' and convalidated")" = 'Mixed Case FK,child_parent_id_fkey'
+test "$(q "select conname from pg_constraint
+            where contype = 'f' and not convalidated")" = legacy_parent_fk
 
-q "select pg_get_constraintdef(oid) from pg_constraint where conname = 'Mixed Case FK'" |
-    grep -q 'DEFERRABLE INITIALLY DEFERRED NOT VALID'
+test "$(catalog_sql 'select status, count(*) from fk_validation_summary group by 1')" = "validated|2"
+
+catalog_sql "select command from fk_constraint_summary
+               join s_fk_constraint on oid = conoid
+              where conname = '\"Mixed Case FK\"'" |
+    grep -q 'DEFERRABLE INITIALLY DEFERRED NOT VALID$'
 
 # the definitions are rendered with an empty search_path
 test "$(catalog_sql "select constraintdef from s_fk_constraint where conname = 'child_parent_id_fkey'")" = \
@@ -224,3 +232,74 @@ PGCOPYDB_TARGET_PGURI="${admin_uri%/*}/unlisted_target" \
 test "$(psql -AtX -d "${admin_uri%/*}/unlisted_target" -c \
     "select count(*) from pg_constraint where conname = 'empty_events_parent_fk'")" = 1
 test "$(sqlite3 -readonly -init /dev/null -batch -noheader -list /tmp/unlisted/schema/source.db 'select count(*) from s_fk_constraint')" = 0
+
+# without --follow, a foreign key that fails to validate fails the clone, and
+# is recorded as failed
+psql -d "${admin_uri}" -c "drop database if exists orphan_source" \
+     -c "create database orphan_source"
+psql -d "${admin_uri}" -c "drop database if exists orphan_target" \
+     -c "create database orphan_target"
+
+psql -d "${admin_uri%/*}/orphan_source" -v ON_ERROR_STOP=1 <<'EOSQL'
+create table parent(id int primary key);
+create table child(id int primary key, parent_id int references parent(id));
+insert into parent select i from generate_series(1, 10) i;
+insert into child select i, 1 + (i % 10) from generate_series(1, 50) i;
+set session_replication_role = replica;
+insert into child values (51, 1000);
+EOSQL
+
+status=0
+PGCOPYDB_SOURCE_PGURI="${admin_uri%/*}/orphan_source" \
+PGCOPYDB_TARGET_PGURI="${admin_uri%/*}/orphan_target" \
+    pgcopydb clone --dir /tmp/orphan --not-consistent \
+        --defer-validate-fks --notice > /tmp/orphan.out 2>&1 || status=$?
+
+if test "${status}" -ne 7; then
+    cat /tmp/orphan.out
+    echo "clone must exit 7 when a foreign key fails to validate, not ${status}"
+    exit 1
+fi
+
+grep "1 deferred foreign key(s) are left NOT VALID on the target, of which 1 failed to validate" \
+    /tmp/orphan.out
+
+test "$(sqlite3 -readonly -init /dev/null -batch -noheader -list \
+    /tmp/orphan/schema/source.db \
+    "select v.status || ' ' || substr(v.error, 1, 5)
+       from fk_validation_summary v
+       join s_fk_constraint f on f.oid = v.conoid
+      where f.conname = 'child_parent_id_fkey'")" = "failed 23503"
+
+test "$(psql -AtX -d "${admin_uri%/*}/orphan_target" -c \
+    "select convalidated from pg_constraint where conname = 'child_parent_id_fkey'")" = f
+
+# the foreign keys of a table are validated one after the other, by the same
+# worker: VALIDATE CONSTRAINT locks the table against itself
+psql -d "${admin_uri}" -c "drop database if exists two_fks_source" \
+     -c "create database two_fks_source"
+psql -d "${admin_uri}" -c "drop database if exists two_fks_target" \
+     -c "create database two_fks_target"
+
+psql -d "${admin_uri%/*}/two_fks_source" -v ON_ERROR_STOP=1 <<'EOSQL'
+create table parent(id int primary key);
+create table other(id int primary key);
+create table child(
+  id int primary key,
+  parent_id int references parent(id),
+  other_id int references other(id)
+);
+insert into parent select i from generate_series(1, 10) i;
+insert into other select i from generate_series(1, 10) i;
+insert into child select i, 1 + (i % 10), 1 + (i % 10) from generate_series(1, 50) i;
+EOSQL
+
+PGCOPYDB_SOURCE_PGURI="${admin_uri%/*}/two_fks_source" \
+PGCOPYDB_TARGET_PGURI="${admin_uri%/*}/two_fks_target" \
+    pgcopydb clone --dir /tmp/two_fks --not-consistent --index-jobs 2 \
+        --defer-validate-fks --notice
+
+test "$(sqlite3 -readonly -init /dev/null -batch -noheader -list \
+    /tmp/two_fks/schema/source.db \
+    "select count(*) || ' ' || count(distinct pid)
+       from fk_validation_summary where status = 'validated'")" = "2 1"

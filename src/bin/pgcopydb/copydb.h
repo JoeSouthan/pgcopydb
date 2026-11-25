@@ -349,6 +349,7 @@ typedef struct CopyDataSpec
 	Queue copyQueue;
 	Queue indexQueue;
 	Queue vacuumQueue;
+	Queue fkValidateQueue;      /* for --defer-validate-fks */
 	Queue loQueue;
 
 	DumpPaths dumpPaths;
