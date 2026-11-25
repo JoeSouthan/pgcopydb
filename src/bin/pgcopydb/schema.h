@@ -268,6 +268,27 @@ typedef struct SourceIndex
 } SourceIndex;
 
 
+/*
+ * SourceFKConstraint caches a foreign key of the source database, for
+ * --defer-validate-fks. conname and qname are quoted for use in DDL.
+ */
+typedef struct SourceFKConstraint
+{
+	uint32_t oid;
+	uint32_t reloid;
+	char conname[PG_NAMEDATALEN_FQ];
+	char nspname[PG_NAMEDATALEN];
+	char relname[PG_NAMEDATALEN];
+	char qname[PG_NAMEDATALEN_FQ];
+	bool condeferrable;
+	bool condeferred;
+	bool convalidated;          /* false when NOT VALID on the source */
+	uint32_t confrelid;         /* referenced table */
+	bool inScope;               /* referenced table is part of the copy */
+	char *constraintDef;        /* malloc'ed area */
+} SourceFKConstraint;
+
+
 /* still used in progress.[ch] */
 typedef struct SourceIndexArray
 {
@@ -350,6 +371,8 @@ typedef struct CatalogSetup
 	uint64_t splitTablesLargerThanBytes;
 	int splitMaxParts;
 	char *filters;              /* malloc'ed area */
+	bool deferValidateFKs;      /* --defer-validate-fks, checked on resume */
+	bool deferValidateFKsSet;   /* false when no owner command has claimed it */
 } CatalogSetup;
 
 typedef enum
@@ -468,6 +491,10 @@ bool schema_set_sequence_value(PGSQL *pgsql, SourceSequence *seq);
 bool schema_list_all_indexes(PGSQL *pgsql,
 							 SourceFilters *filters,
 							 DatabaseCatalog *catalog);
+
+bool schema_list_fk_constraints(PGSQL *pgsql,
+								SourceFilters *filters,
+								DatabaseCatalog *catalog);
 
 bool schema_list_pg_depend(PGSQL *pgsql,
 						   SourceFilters *filters,

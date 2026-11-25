@@ -24,6 +24,7 @@
 static bool copydb_fetch_source_catalog_setup(CopyDataSpec *specs);
 static bool copydb_fetch_previous_run_state(CopyDataSpec *specs);
 static bool copydb_fetch_source_schema(CopyDataSpec *specs, PGSQL *src);
+static bool copydb_fetch_fk_constraints(CopyDataSpec *specs, PGSQL *src);
 
 static bool copydb_prepare_table_specs_hook(void *ctx, SourceTable *source);
 
@@ -48,7 +49,12 @@ copydb_fetch_schema_and_prepare_specs(CopyDataSpec *specs)
 	if (!specs->fetchCatalogs)
 	{
 		log_info("Re-using catalog caches");
-		return true;
+
+		/*
+		 * The cache might have been filled by a command that did not list the
+		 * foreign keys, when --defer-validate-fks is used for the first time.
+		 */
+		return copydb_fetch_fk_constraints(specs, NULL);
 	}
 
 	if (!summary_start_timing(&(specs->catalogs.source),
@@ -135,6 +141,12 @@ copydb_fetch_schema_and_prepare_specs(CopyDataSpec *specs)
 		return false;
 	}
 
+	if (!copydb_fetch_fk_constraints(specs, src))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
 	/* time to finish the transaction on the source database */
 	if (preparedSnapshot)
 	{
@@ -188,6 +200,102 @@ copydb_fetch_schema_and_prepare_specs(CopyDataSpec *specs)
 	}
 
 	return true;
+}
+
+
+/*
+ * copydb_fetch_fk_constraints lists the foreign keys that --defer-validate-fks
+ * creates on the target. They are fetched on their own rather than with the
+ * indexes, because the other sections may have been fetched already by a
+ * command that does not know about the option. When src is NULL a new
+ * connection is used.
+ */
+static bool
+copydb_fetch_fk_constraints(CopyDataSpec *specs, PGSQL *src)
+{
+	DatabaseCatalog *sourceDB = &(specs->catalogs.source);
+
+	if (!specs->deferValidateFKs)
+	{
+		return true;
+	}
+
+	bool fetched = false;
+
+	if (!catalog_section_is_fetched(sourceDB, FK_CONSTRAINTS_SECTION, &fetched))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (fetched)
+	{
+		return true;
+	}
+
+	PGSQL pgsql = { 0 };
+
+	if (src == NULL)
+	{
+		if (!pgsql_init(&pgsql, specs->connStrings.source_pguri,
+						PGSQL_CONN_SOURCE))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		src = &pgsql;
+
+		/* the search_path used to list the foreign keys needs a transaction */
+		if (!pgsql_begin(src))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+	}
+
+	TopLevelTiming timing = { .label = FK_CONSTRAINTS_SECTION };
+
+	(void) catalog_start_timing(&timing);
+
+	if (!semaphore_lock(&(sourceDB->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/*
+	 * The foreign keys and their section are written in one transaction, so
+	 * that a crash in between does not leave rows that a resume would insert
+	 * again.
+	 */
+	bool success = catalog_begin(sourceDB, false);
+
+	if (success)
+	{
+		success = schema_list_fk_constraints(src, &(specs->filters), sourceDB);
+	}
+
+	if (success)
+	{
+		(void) catalog_stop_timing(&timing);
+		success = catalog_register_section(sourceDB, &timing) &&
+				  catalog_commit(sourceDB);
+	}
+
+	if (!success)
+	{
+		(void) catalog_execute(sourceDB, "ROLLBACK");
+	}
+
+	(void) semaphore_unlock(&(sourceDB->sema));
+
+	if (src == &pgsql)
+	{
+		(void) pgsql_rollback(&pgsql);
+	}
+
+	return success;
 }
 
 

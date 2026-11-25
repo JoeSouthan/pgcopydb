@@ -130,6 +130,14 @@ typedef struct SourceIndexArrayContext
 	bool parsedOk;
 } SourceIndexArrayContext;
 
+/* Context used when fetching all the foreign keys */
+typedef struct SourceFKConstraintArrayContext
+{
+	char sqlstate[SQLSTATE_LENGTH];
+	DatabaseCatalog *catalog;
+	bool parsedOk;
+} SourceFKConstraintArrayContext;
+
 /* Context used when fetching all the table dependencies */
 typedef struct SourceDependArrayContext
 {
@@ -202,6 +210,7 @@ static bool parseCurrentSourceSequence(PGresult *result,
 									   SourceSequence *seq);
 
 static void getIndexArray(void *ctx, PGresult *result);
+static void getFKConstraintArray(void *ctx, PGresult *result);
 
 static bool parseCurrentSourceIndex(PGresult *result,
 									int rowNumber,
@@ -1228,6 +1237,92 @@ schema_list_all_indexes(PGSQL *pgsql,
 	if (!context.parsedOk)
 	{
 		log_error("Failed to list all indexes");
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * schema_list_fk_constraints grabs the list of foreign keys from the given
+ * source Postgres instance and stores the result in the SQLite catalog.
+ *
+ * Uses list_source_fk_constraints.sql with one parameter:
+ *   $1::oid[] = referencing table OIDs from s_table
+ */
+bool
+schema_list_fk_constraints(PGSQL *pgsql,
+						   SourceFilters *filters,
+						   DatabaseCatalog *catalog)
+{
+	SourceFKConstraintArrayContext context = { { 0 }, catalog, false };
+
+	log_trace("schema_list_fk_constraints[%s]", filterTypeToString(filters->type));
+
+	if (pgsql->pgversion_num == 0 && !pgsql_server_version(pgsql))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* pg_constraint.conparentid is new in Postgres 11 */
+	if (pgsql->pgversion_num < 110000)
+	{
+		log_error("--defer-validate-fks requires a source running "
+				  "PostgreSQL 11 or later, found version %s",
+				  pgsql->pgversion);
+		return false;
+	}
+
+	char *table_oids = NULL;
+	int table_count = 0;
+
+	if (!catalog_s_table_oid_array(catalog, &table_oids, &table_count))
+	{
+		log_error("Failed to build table OID array for foreign keys query");
+		return false;
+	}
+
+	const char *sql = NULL;
+
+	if (!pgcopydb_sql_list_source_fk_constraints(&sql))
+	{
+		return false;
+	}
+
+	int paramCount = 1;
+	Oid paramTypes[1] = { TEXTOID };
+	const char *paramValues[1] = { table_oids };
+
+	/*
+	 * pg_get_constraintdef() omits the schema of tables that are visible in
+	 * the search_path, which would resolve differently on the target. The
+	 * connection must be in a transaction for the setting to stick.
+	 */
+	if (!pgsql_execute(pgsql, "SET search_path TO ''"))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!pgsql_execute_with_params(pgsql, sql,
+								   paramCount, paramTypes, paramValues,
+								   &context, &getFKConstraintArray))
+	{
+		log_error("Failed to list foreign keys");
+		return false;
+	}
+
+	if (!pgsql_execute(pgsql, "RESET search_path"))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!context.parsedOk)
+	{
+		log_error("Failed to list foreign keys");
 		return false;
 	}
 
@@ -3459,6 +3554,90 @@ parseCurrentSourceSequence(PGresult *result, int rowNumber, SourceSequence *seq)
 	}
 
 	return errors == 0;
+}
+
+
+/*
+ * getFKConstraintArray loops over the SQL result for the foreign keys query
+ * and adds each row to the catalog.
+ */
+static void
+getFKConstraintArray(void *ctx, PGresult *result)
+{
+	SourceFKConstraintArrayContext *context =
+		(SourceFKConstraintArrayContext *) ctx;
+
+	int nTuples = PQntuples(result);
+
+	if (PQnfields(result) != 12)
+	{
+		log_error("Query returned %d columns, expected 12", PQnfields(result));
+		context->parsedOk = false;
+		return;
+	}
+
+	context->parsedOk = true;
+
+	for (int rowNumber = 0; rowNumber < nTuples; rowNumber++)
+	{
+		SourceFKConstraint fk = { 0 };
+
+		char *oid = PQgetvalue(result, rowNumber, 0);
+		char *reloid = PQgetvalue(result, rowNumber, 1);
+
+		if (!stringToUInt32(oid, &(fk.oid)) ||
+			!stringToUInt32(reloid, &(fk.reloid)))
+		{
+			log_error("Invalid OID \"%s\" or \"%s\" for a foreign key",
+					  oid, reloid);
+			context->parsedOk = false;
+			return;
+		}
+
+		strlcpy(fk.conname, PQgetvalue(result, rowNumber, 2),
+				sizeof(fk.conname));
+		strlcpy(fk.nspname, PQgetvalue(result, rowNumber, 3),
+				sizeof(fk.nspname));
+		strlcpy(fk.relname, PQgetvalue(result, rowNumber, 4),
+				sizeof(fk.relname));
+		strlcpy(fk.qname, PQgetvalue(result, rowNumber, 5),
+				sizeof(fk.qname));
+
+		fk.condeferrable = (*PQgetvalue(result, rowNumber, 6) == 't');
+		fk.condeferred = (*PQgetvalue(result, rowNumber, 7) == 't');
+		fk.convalidated = (*PQgetvalue(result, rowNumber, 8) == 't');
+
+		char *confrelid = PQgetvalue(result, rowNumber, 10);
+
+		if (!stringToUInt32(confrelid, &(fk.confrelid)))
+		{
+			log_error("Invalid OID \"%s\" for a foreign key", confrelid);
+			context->parsedOk = false;
+			return;
+		}
+
+		fk.inScope = (*PQgetvalue(result, rowNumber, 11) == 't');
+
+		fk.constraintDef = strdup(PQgetvalue(result, rowNumber, 9));
+
+		if (fk.constraintDef == NULL)
+		{
+			log_error(ALLOCATION_FAILED_ERROR);
+			context->parsedOk = false;
+			return;
+		}
+
+		bool added = catalog_add_s_fk_constraint(context->catalog, &fk);
+
+		free(fk.constraintDef);
+
+		if (!added)
+		{
+			log_error("Failed to add foreign key %s to the catalog", fk.conname);
+			context->parsedOk = false;
+			return;
+		}
+	}
 }
 
 

@@ -29,6 +29,9 @@
 #include "summary.h"
 
 
+static bool catalog_upgrade_source_schema(DatabaseCatalog *catalog);
+
+
 /*
  * pgcopydb catalog cache is a SQLite database with the following schema:
  */
@@ -52,6 +55,33 @@
  * This is critical for INSERT OR IGNORE / INSERT OR REPLACE semantics: SQLite
  * needs the unique index present at insert time to suppress duplicates.
  */
+/*
+ * Foreign keys, used by --defer-validate-fks. conname and qname are stored
+ * already quoted for use in DDL. The tables are also added to the catalogs of
+ * older pgcopydb versions, see catalog_upgrade_source_schema.
+ */
+#define S_FK_CONSTRAINT_DDL \
+	"create table if not exists s_fk_constraint(" \
+	"  oid integer primary key, conname text, nspname text, relname text, " \
+	"  qname text, reloid integer, condeferrable bool, condeferred bool, " \
+	"  convalidated bool, constraintdef text, " \
+	"  confrelid integer, in_scope bool" \
+	")"
+
+#define FK_CONSTRAINT_SUMMARY_DDL \
+	"create table if not exists fk_constraint_summary(" \
+	"  conoid integer primary key references s_fk_constraint(oid), " \
+	"  pid integer, start_time_epoch integer, done_time_epoch integer, " \
+	"  duration integer, status text, command text" \
+	")"
+
+#define FK_VALIDATION_SUMMARY_DDL \
+	"create table if not exists fk_validation_summary(" \
+	"  conoid integer primary key references s_fk_constraint(oid), " \
+	"  pid integer, start_time_epoch integer, done_time_epoch integer, " \
+	"  duration integer, status text, error text" \
+	")"
+
 static char *sourceDBcreateTableDDLs[] = {
 	/*
 	 * filters: JSON representation of the parsed SourceFilters struct,
@@ -64,7 +94,8 @@ static char *sourceDBcreateTableDDLs[] = {
 	"  snapshot text, "
 	"  split_tables_larger_than integer, "
 	"  split_max_parts integer, "
-	"  filters text"
+	"  filters text, "
+	"  defer_validate_fks integer"
 	")",
 
 	/*
@@ -164,6 +195,11 @@ static char *sourceDBcreateTableDDLs[] = {
 	"  last_value integer, isCalled bool, "
 	"  primary key(oid, ownedby, attrelid, attroid)"
 	")",
+
+	/* foreign keys, used by --defer-validate-fks */
+	S_FK_CONSTRAINT_DDL,
+	FK_CONSTRAINT_SUMMARY_DDL,
+	FK_VALIDATION_SUMMARY_DDL,
 
 	/* internal activity tracking / completion / statistics */
 	"create table process("
@@ -969,7 +1005,9 @@ catalog_register_setup_from_specs(CopyDataSpec *copySpecs)
 									snapStr,
 									copySpecs->splitTablesLargerThan.bytes,
 									copySpecs->splitMaxParts,
-									filterJson))
+									filterJson,
+									copySpecs->ownsDeferValidateFKs,
+									copySpecs->deferValidateFKs))
 		{
 			/* errors have already been logged */
 			json_free_serialized_string(json);
@@ -985,6 +1023,44 @@ catalog_register_setup_from_specs(CopyDataSpec *copySpecs)
 				  setup->source_pguri,
 				  setup->target_pguri,
 				  setup->snapshot);
+
+		/*
+		 * --defer-validate-fks must not change across a resume: dropping it
+		 * would create the remaining foreign keys VALID, with the validation
+		 * scan the flag exists to avoid, and adding it would leave earlier
+		 * ones validated. Only pgcopydb clone owns the flag, other commands
+		 * never store nor compare it.
+		 *
+		 * A catalog registered by another command stores NULL, "no owner has
+		 * claimed the flag yet": the first clone records its value instead
+		 * of comparing.
+		 */
+		if (copySpecs->ownsDeferValidateFKs && !setup->deferValidateFKsSet)
+		{
+			if (!catalog_update_defer_validate_fks(sourceDB,
+												   copySpecs->deferValidateFKs))
+			{
+				/* errors have already been logged */
+				json_free_serialized_string(json);
+				return false;
+			}
+
+			setup->deferValidateFKs = copySpecs->deferValidateFKs;
+			setup->deferValidateFKsSet = true;
+		}
+		else if (copySpecs->ownsDeferValidateFKs &&
+				 copySpecs->deferValidateFKs != setup->deferValidateFKs)
+		{
+			log_error("Catalogs at \"%s\" have been setup with "
+					  "--defer-validate-fks %s and current run uses %s; "
+					  "resume with the same flag value",
+					  sourceDB->dbfile,
+					  setup->deferValidateFKs ? "enabled" : "disabled",
+					  copySpecs->deferValidateFKs ? "enabled" : "disabled");
+
+			json_free_serialized_string(json);
+			return false;
+		}
 
 		if (!streq(spguri.pguri, setup->source_pguri))
 		{
@@ -1605,6 +1681,15 @@ catalog_init(DatabaseCatalog *catalog)
 		return true;
 	}
 
+	if (catalog->type == DATABASE_CATALOG_TYPE_SOURCE &&
+		!catalog_upgrade_source_schema(catalog))
+	{
+		/* errors have already been logged */
+		sqlite3_close(catalog->db);
+		catalog->db = NULL;
+		return false;
+	}
+
 	return true;
 }
 
@@ -2175,6 +2260,127 @@ catalog_upgrade_output_schema(DatabaseCatalog *catalog)
 
 
 /*
+ * catalog_source_lacks_fk_schema sets lacksColumn and lacksTables when a
+ * source catalog predates the --defer-validate-fks column and tables. A
+ * catalog without a setup table is still being created, and lacks nothing.
+ */
+static bool
+catalog_source_lacks_fk_schema(DatabaseCatalog *catalog,
+							   bool *lacksColumn,
+							   bool *lacksTables)
+{
+	char *sql =
+		"with t(name) as (select name from sqlite_master where type = 'table') "
+		"select exists(select 1 from t where name = 'setup') "
+		"   and not exists(select 1 from pragma_table_info('setup') "
+		"                   where name = 'defer_validate_fks'), "
+		"       exists(select 1 from t where name = 'setup') "
+		"   and not exists(select 1 from t "
+		"                   where name = 'fk_validation_summary')";
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(catalog->db, sql, &query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (catalog_sql_step(&query) != SQLITE_ROW)
+	{
+		log_error("Failed to check the setup table of \"%s\": %s",
+				  catalog->dbfile,
+				  sqlite3_errmsg(catalog->db));
+		(void) catalog_sql_finalize(&query);
+		return false;
+	}
+
+	*lacksColumn = sqlite3_column_int(query.ppStmt, 0) == 1;
+	*lacksTables = sqlite3_column_int(query.ppStmt, 1) == 1;
+
+	return catalog_sql_finalize(&query);
+}
+
+
+/*
+ * catalog_upgrade_source_schema adds the --defer-validate-fks column and
+ * tables to a source catalog written by an older pgcopydb, so that every
+ * command can use it. The column is left NULL: no clone has claimed the flag.
+ */
+static bool
+catalog_upgrade_source_schema(DatabaseCatalog *catalog)
+{
+	bool lacksColumn = false;
+	bool lacksTables = false;
+
+	/* the common case only reads the schema, and takes no lock */
+	if (!catalog_source_lacks_fk_schema(catalog, &lacksColumn, &lacksTables))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!lacksColumn && !lacksTables)
+	{
+		return true;
+	}
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!catalog_begin(catalog, true))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	char *ddls[] = {
+		S_FK_CONSTRAINT_DDL,
+		FK_CONSTRAINT_SUMMARY_DDL,
+		FK_VALIDATION_SUMMARY_DDL
+	};
+
+	/* another process might have upgraded the catalog in the meantime */
+	bool success =
+		catalog_source_lacks_fk_schema(catalog, &lacksColumn, &lacksTables);
+
+	if (success && lacksColumn)
+	{
+		log_notice("Adding column setup.defer_validate_fks to \"%s\"",
+				   catalog->dbfile);
+
+		success = catalog_execute(catalog,
+								  "alter table setup "
+								  "add column defer_validate_fks integer");
+	}
+
+	int count = sizeof(ddls) / sizeof(ddls[0]);
+
+	for (int i = 0; success && lacksTables && i < count; i++)
+	{
+		success = catalog_execute(catalog, ddls[i]);
+	}
+
+	if (success)
+	{
+		success = catalog_commit(catalog);
+	}
+	else
+	{
+		(void) catalog_execute(catalog, "ROLLBACK");
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return success;
+}
+
+
+/*
  * catalog_in_transaction returns true when a transaction opened with
  * catalog_begin is still open on the catalog.
  */
@@ -2205,7 +2411,9 @@ catalog_register_setup(DatabaseCatalog *catalog,
 					   const char *snapshot,
 					   uint64_t splitTablesLargerThanBytes,
 					   int splitMaxParts,
-					   const char *filters)
+					   const char *filters,
+					   bool claimDeferValidateFKs,
+					   bool deferValidateFKs)
 {
 	sqlite3 *db = catalog->db;
 
@@ -2218,8 +2426,8 @@ catalog_register_setup(DatabaseCatalog *catalog,
 	char *sql =
 		"insert into setup("
 		"  id, source_pg_uri, target_pg_uri, snapshot, filters, "
-		"  split_tables_larger_than, split_max_parts) "
-		"values($1, $2, $3, $4, $5, $6, $7)";
+		"  defer_validate_fks, split_tables_larger_than, split_max_parts) "
+		"values($1, $2, $3, $4, $5, $6, $7, $8)";
 
 	SQLiteQuery query = { 0 };
 
@@ -2229,6 +2437,14 @@ catalog_register_setup(DatabaseCatalog *catalog,
 		{ BIND_PARAMETER_TYPE_TEXT, "target_pg_uri", 0, (char *) target_pg_uri },
 		{ BIND_PARAMETER_TYPE_TEXT, "snapshot", 0, (char *) snapshot },
 		{ BIND_PARAMETER_TYPE_TEXT, "filters", 0, (char *) filters },
+
+		/* before the split columns: count trimming below drops the tail */
+		{
+			claimDeferValidateFKs
+			? BIND_PARAMETER_TYPE_INT : BIND_PARAMETER_TYPE_TEXT,
+			"defer_validate_fks",
+			deferValidateFKs ? 1 : 0, NULL
+		},
 
 		{
 			BIND_PARAMETER_TYPE_INT64, "split_tables_larger_than",
@@ -2253,8 +2469,9 @@ catalog_register_setup(DatabaseCatalog *catalog,
 	{
 		sql =
 			"insert into setup("
-			"  id, source_pg_uri, target_pg_uri, snapshot, filters) "
-			"values($1, $2, $3, $4, $5)";
+			"  id, source_pg_uri, target_pg_uri, snapshot, filters, "
+			"  defer_validate_fks) "
+			"values($1, $2, $3, $4, $5, $6)";
 
 		count -= 2;
 	}
@@ -2263,8 +2480,8 @@ catalog_register_setup(DatabaseCatalog *catalog,
 		sql =
 			"insert into setup("
 			"  id, source_pg_uri, target_pg_uri, snapshot, filters, "
-			"  split_tables_larger_than) "
-			"values($1, $2, $3, $4, $5, $6)";
+			"  defer_validate_fks, split_tables_larger_than) "
+			"values($1, $2, $3, $4, $5, $6, $7)";
 
 		--count;
 	}
@@ -2318,6 +2535,8 @@ catalog_setup(DatabaseCatalog *catalog)
 	catalog->setup.filters = NULL;
 	catalog->setup.splitTablesLargerThanBytes = 0;
 	catalog->setup.splitMaxParts = 0;
+	catalog->setup.deferValidateFKs = false;
+	catalog->setup.deferValidateFKsSet = false;
 
 	SQLiteQuery query = {
 		.context = &(catalog->setup),
@@ -2326,7 +2545,8 @@ catalog_setup(DatabaseCatalog *catalog)
 
 	char *sql =
 		"select id, source_pg_uri, target_pg_uri, snapshot, "
-		"       split_tables_larger_than, split_max_parts, filters "
+		"       split_tables_larger_than, split_max_parts, filters, "
+		"       defer_validate_fks "
 		"from setup";
 
 	if (!semaphore_lock(&(catalog->sema)))
@@ -2497,6 +2717,71 @@ catalog_update_filters(DatabaseCatalog *catalog, const char *filters)
 
 
 /*
+ * catalog_update_defer_validate_fks records the --defer-validate-fks value in
+ * the setup table, for a catalog registered before any owner command ran.
+ */
+bool
+catalog_update_defer_validate_fks(DatabaseCatalog *catalog,
+								  bool deferValidateFKs)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_update_defer_validate_fks: db is NULL");
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	char *sql =
+		"update setup "
+		"   set defer_validate_fks = $1 "
+		" where id = 1";
+
+	BindParam params[] = {
+		{
+			BIND_PARAMETER_TYPE_INT, "defer_validate_fks",
+			deferValidateFKs ? 1 : 0, NULL
+		}
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
  * catalog_section_fetch is a SQLiteQuery callback.
  */
 bool
@@ -2599,6 +2884,14 @@ catalog_setup_fetch(SQLiteQuery *query)
 				(char *) sqlite3_column_text(query->ppStmt, 6),
 				bytes);
 	}
+
+	/* defer_validate_fks is NULL until an owner command claims it */
+	setup->deferValidateFKsSet =
+		sqlite3_column_type(query->ppStmt, 7) != SQLITE_NULL;
+
+	setup->deferValidateFKs =
+		setup->deferValidateFKsSet &&
+		sqlite3_column_int(query->ppStmt, 7) == 1;
 
 	return true;
 }
@@ -3029,6 +3322,59 @@ catalog_section_state(DatabaseCatalog *catalog, CatalogSection *section)
 	}
 
 	return true;
+}
+
+
+/*
+ * catalog_section_is_fetched checks if a section registered by name, which is
+ * not necessarily a CopyDataSection, has been fetched already.
+ */
+bool
+catalog_section_is_fetched(DatabaseCatalog *catalog,
+						   const char *name,
+						   bool *fetched)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_section_is_fetched: db is NULL");
+		return false;
+	}
+
+	char *sql = "select count(*) from section where name = $1 and fetched = 1";
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_TEXT, "name", 0, (char *) name }
+	};
+
+	if (!catalog_sql_bind(&query, params, 1))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	int rc = catalog_sql_step(&query);
+
+	if (rc != SQLITE_ROW)
+	{
+		log_error("Failed to step through statement: %s", query.sql);
+		log_error("[SQLite] %s", sqlite3_errmsg(query.db));
+		(void) catalog_sql_finalize(&query);
+		return false;
+	}
+
+	*fetched = sqlite3_column_int(query.ppStmt, 0) > 0;
+
+	return catalog_sql_finalize(&query);
 }
 
 
@@ -6860,6 +7206,610 @@ catalog_iter_s_index_finish(SourceIndexIterator *iter)
 
 
 /*
+ * catalog_add_s_fk_constraint adds a foreign key to the s_fk_constraint
+ * catalog.
+ */
+bool
+catalog_add_s_fk_constraint(DatabaseCatalog *catalog, SourceFKConstraint *fk)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_add_s_fk_constraint: db is NULL");
+		return false;
+	}
+
+	char *sql =
+		"insert into s_fk_constraint("
+		"  oid, conname, nspname, relname, qname, reloid, "
+		"  condeferrable, condeferred, convalidated, constraintdef, "
+		"  confrelid, in_scope) "
+		"values($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)";
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "oid", fk->oid, NULL },
+		{ BIND_PARAMETER_TYPE_TEXT, "conname", 0, fk->conname },
+		{ BIND_PARAMETER_TYPE_TEXT, "nspname", 0, fk->nspname },
+		{ BIND_PARAMETER_TYPE_TEXT, "relname", 0, fk->relname },
+		{ BIND_PARAMETER_TYPE_TEXT, "qname", 0, fk->qname },
+		{ BIND_PARAMETER_TYPE_INT64, "reloid", fk->reloid, NULL },
+		{ BIND_PARAMETER_TYPE_INT, "condeferrable",
+		  fk->condeferrable ? 1 : 0, NULL },
+		{ BIND_PARAMETER_TYPE_INT, "condeferred",
+		  fk->condeferred ? 1 : 0, NULL },
+		{ BIND_PARAMETER_TYPE_INT, "convalidated",
+		  fk->convalidated ? 1 : 0, NULL },
+		{ BIND_PARAMETER_TYPE_TEXT, "constraintdef", 0, fk->constraintDef },
+		{ BIND_PARAMETER_TYPE_INT64, "confrelid", fk->confrelid, NULL },
+		{ BIND_PARAMETER_TYPE_INT, "in_scope", fk->inScope ? 1 : 0, NULL }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
+}
+
+
+#define CATALOG_S_FK_CONSTRAINT_COLUMNS \
+	"oid, conname, nspname, relname, qname, reloid, " \
+	"condeferrable, condeferred, convalidated, constraintdef, " \
+	"confrelid, in_scope"
+
+
+/*
+ * catalog_s_fk_constraint_fetch populates a SourceFKConstraint from a SQLite
+ * query result row. The caller owns the allocated constraintDef.
+ */
+bool
+catalog_s_fk_constraint_fetch(SQLiteQuery *query)
+{
+	SourceFKConstraint *fk = (SourceFKConstraint *) query->context;
+
+	/* cleanup the memory area before re-use */
+	bzero(fk, sizeof(SourceFKConstraint));
+
+	fk->oid = sqlite3_column_int64(query->ppStmt, 0);
+
+	strlcpy(fk->conname,
+			(char *) sqlite3_column_text(query->ppStmt, 1),
+			sizeof(fk->conname));
+
+	strlcpy(fk->nspname,
+			(char *) sqlite3_column_text(query->ppStmt, 2),
+			sizeof(fk->nspname));
+
+	strlcpy(fk->relname,
+			(char *) sqlite3_column_text(query->ppStmt, 3),
+			sizeof(fk->relname));
+
+	strlcpy(fk->qname,
+			(char *) sqlite3_column_text(query->ppStmt, 4),
+			sizeof(fk->qname));
+
+	fk->reloid = sqlite3_column_int64(query->ppStmt, 5);
+
+	fk->condeferrable = sqlite3_column_int(query->ppStmt, 6) == 1;
+	fk->condeferred = sqlite3_column_int(query->ppStmt, 7) == 1;
+	fk->convalidated = sqlite3_column_int(query->ppStmt, 8) == 1;
+	fk->confrelid = sqlite3_column_int64(query->ppStmt, 10);
+	fk->inScope = sqlite3_column_int(query->ppStmt, 11) == 1;
+
+	if (sqlite3_column_type(query->ppStmt, 9) != SQLITE_NULL)
+	{
+		int bytes = sqlite3_column_bytes(query->ppStmt, 9) + 1;
+
+		fk->constraintDef = (char *) calloc(bytes, sizeof(char));
+
+		if (fk->constraintDef == NULL)
+		{
+			log_fatal(ALLOCATION_FAILED_ERROR);
+			return false;
+		}
+
+		strlcpy(fk->constraintDef,
+				(char *) sqlite3_column_text(query->ppStmt, 9),
+				bytes);
+	}
+
+	return true;
+}
+
+
+/*
+ * catalog_lookup_s_fk_constraint_by_oid fetches a SourceFKConstraint entry
+ * from our catalogs.
+ */
+bool
+catalog_lookup_s_fk_constraint_by_oid(DatabaseCatalog *catalog,
+									  SourceFKConstraint *fk,
+									  uint32_t oid)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_lookup_s_fk_constraint_by_oid: db is NULL");
+		return false;
+	}
+
+	char *sql =
+		"  select " CATALOG_S_FK_CONSTRAINT_COLUMNS
+		"    from s_fk_constraint "
+		"   where oid = $1";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = {
+		.context = fk,
+		.fetchFunction = &catalog_s_fk_constraint_fetch
+	};
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "oid", oid, NULL }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which return exactly one row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * catalog_iter_s_fk_constraint iterates over the list of foreign keys in our
+ * catalogs. The callback owns fk->constraintDef when it sets the pointer to
+ * NULL, otherwise it is released before the next row.
+ */
+bool
+catalog_iter_s_fk_constraint(DatabaseCatalog *catalog,
+							 void *context,
+							 SourceFKConstraintIterFun *callback)
+{
+	SourceFKConstraintIterator *iter =
+		(SourceFKConstraintIterator *) calloc(1, sizeof(SourceFKConstraintIterator));
+
+	if (iter == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	iter->catalog = catalog;
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		free(iter);
+		return false;
+	}
+
+	if (!catalog_iter_s_fk_constraint_init(iter))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		free(iter);
+		return false;
+	}
+
+	bool success = true;
+
+	for (;;)
+	{
+		if (!catalog_iter_s_fk_constraint_next(iter))
+		{
+			/* errors have already been logged */
+			success = false;
+			break;
+		}
+
+		SourceFKConstraint *fk = iter->fk;
+
+		if (fk == NULL)
+		{
+			break;
+		}
+
+		/* now call the provided callback */
+		bool ok = (*callback)(context, fk);
+
+		free(fk->constraintDef);
+		fk->constraintDef = NULL;
+
+		if (!ok)
+		{
+			log_error("Failed to iterate over list of foreign keys, "
+					  "see above for details");
+			success = false;
+			break;
+		}
+	}
+
+	if (!catalog_iter_s_fk_constraint_finish(iter))
+	{
+		success = false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+	free(iter);
+
+	return success;
+}
+
+
+/*
+ * catalog_iter_s_fk_constraint_init initializes an Iterator over our catalog
+ * of SourceFKConstraint entries.
+ */
+bool
+catalog_iter_s_fk_constraint_init(SourceFKConstraintIterator *iter)
+{
+	sqlite3 *db = iter->catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: Failed to initialize s_fk_constraint iterator: "
+				  "db is NULL");
+		return false;
+	}
+
+	char *sql =
+		"  select " CATALOG_S_FK_CONSTRAINT_COLUMNS
+		"    from s_fk_constraint "
+		"order by nspname, relname, conname";
+
+	SQLiteQuery *query = &(iter->query);
+
+	query->context = &(iter->row);
+	query->fetchFunction = &catalog_s_fk_constraint_fetch;
+
+	if (!catalog_sql_prepare(db, sql, query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * catalog_iter_s_fk_constraint_next fetches the next SourceFKConstraint entry
+ * in our catalogs.
+ */
+bool
+catalog_iter_s_fk_constraint_next(SourceFKConstraintIterator *iter)
+{
+	SQLiteQuery *query = &(iter->query);
+
+	int rc = catalog_sql_step(query);
+
+	if (rc == SQLITE_DONE)
+	{
+		iter->fk = NULL;
+
+		return true;
+	}
+
+	if (rc != SQLITE_ROW)
+	{
+		log_error("Failed to step through statement: %s", query->sql);
+		log_error("[SQLite] %s", sqlite3_errmsg(query->db));
+		return false;
+	}
+
+	iter->fk = &(iter->row);
+
+	return catalog_s_fk_constraint_fetch(query);
+}
+
+
+/*
+ * catalog_iter_s_fk_constraint_finish cleans-up the internal memory used for
+ * the iteration.
+ */
+bool
+catalog_iter_s_fk_constraint_finish(SourceFKConstraintIterator *iter)
+{
+	iter->fk = NULL;
+
+	return catalog_sql_finalize(&(iter->query));
+}
+
+
+/*
+ * The deferred foreign keys left to validate: created NOT VALID by pgcopydb,
+ * and not validated yet. A failed validation is still pending.
+ */
+#define FK_VALIDATION_PENDING \
+	"     from fk_constraint_summary s " \
+	"          join s_fk_constraint f on f.oid = s.conoid " \
+	"          left join fk_validation_summary v on v.conoid = s.conoid " \
+	"    where s.status = 'created' " \
+	"      and (v.status is null or v.status <> 'validated') "
+
+
+typedef struct FKValidationCounts
+{
+	int pending;
+	int failed;
+} FKValidationCounts;
+
+
+/*
+ * catalog_count_fk_validation_fetch fetches the counts of the deferred
+ * foreign keys left to validate, and of those that failed to validate.
+ */
+static bool
+catalog_count_fk_validation_fetch(SQLiteQuery *query)
+{
+	FKValidationCounts *counts = (FKValidationCounts *) query->context;
+
+	counts->pending = sqlite3_column_int(query->ppStmt, 0);
+	counts->failed = sqlite3_column_int(query->ppStmt, 1);
+
+	return true;
+}
+
+
+/*
+ * catalog_count_fk_validation counts the deferred foreign keys that are left
+ * to validate, and the ones of those whose last validation failed.
+ */
+bool
+catalog_count_fk_validation(DatabaseCatalog *catalog, int *pending, int *failed)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_count_fk_validation: db is NULL");
+		return false;
+	}
+
+	char *sql =
+		"   select count(*), "
+		"          count(*) filter (where v.status = 'failed') "
+		FK_VALIDATION_PENDING;
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	FKValidationCounts counts = { 0 };
+
+	SQLiteQuery query = {
+		.context = &counts,
+		.fetchFunction = &catalog_count_fk_validation_fetch
+	};
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which return exactly one row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	*pending = counts.pending;
+	*failed = counts.failed;
+
+	return true;
+}
+
+
+/*
+ * catalog_list_fk_validation_oids runs the given query, which returns one OID
+ * per row, and collects the OIDs in a malloc'ed array.
+ */
+static bool
+catalog_list_fk_validation_oids(DatabaseCatalog *catalog,
+								const char *sql,
+								BindParam *params,
+								int paramCount,
+								uint32_t **oids,
+								int *count)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_list_fk_validation_oids: db is NULL");
+		return false;
+	}
+
+	*oids = NULL;
+	*count = 0;
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	if (paramCount > 0 && !catalog_sql_bind(&query, params, paramCount))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	int capacity = 0;
+	bool success = true;
+
+	for (;;)
+	{
+		int rc = catalog_sql_step(&query);
+
+		if (rc == SQLITE_DONE)
+		{
+			break;
+		}
+
+		if (rc != SQLITE_ROW)
+		{
+			log_error("Failed to step through statement: %s", query.sql);
+			log_error("[SQLite] %s", sqlite3_errmsg(query.db));
+			success = false;
+			break;
+		}
+
+		if (*count >= capacity)
+		{
+			capacity = capacity == 0 ? 16 : capacity * 2;
+
+			uint32_t *array =
+				(uint32_t *) realloc(*oids, capacity * sizeof(uint32_t));
+
+			if (array == NULL)
+			{
+				log_error(ALLOCATION_FAILED_ERROR);
+				success = false;
+				break;
+			}
+
+			*oids = array;
+		}
+
+		(*oids)[(*count)++] = sqlite3_column_int64(query.ppStmt, 0);
+	}
+
+	if (!catalog_sql_finalize(&query))
+	{
+		success = false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	if (!success)
+	{
+		free(*oids);
+		*oids = NULL;
+		*count = 0;
+	}
+
+	return success;
+}
+
+
+/*
+ * catalog_list_fk_validation_pending_tables returns in a malloc'ed array the
+ * OIDs of the tables that have deferred foreign keys left to validate, the
+ * largest tables first.
+ */
+bool
+catalog_list_fk_validation_pending_tables(DatabaseCatalog *catalog,
+										  uint32_t **reloids,
+										  int *count)
+{
+	char *sql =
+		"   select f.reloid "
+		FK_VALIDATION_PENDING
+		" group by f.reloid "
+		" order by (select bytes from s_table_size ts where ts.oid = f.reloid) "
+		"          desc nulls last, "
+		"          f.reloid";
+
+	return catalog_list_fk_validation_oids(catalog, sql, NULL, 0,
+										   reloids, count);
+}
+
+
+/*
+ * catalog_list_fk_validation_pending_by_table returns in a malloc'ed array the
+ * OIDs of the deferred foreign keys of the given table left to validate.
+ */
+bool
+catalog_list_fk_validation_pending_by_table(DatabaseCatalog *catalog,
+											uint32_t reloid,
+											uint32_t **oids,
+											int *count)
+{
+	char *sql =
+		"   select f.oid "
+		FK_VALIDATION_PENDING
+		"      and f.reloid = $1 "
+		" order by f.oid";
+
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "reloid", reloid, NULL }
+	};
+
+	return catalog_list_fk_validation_oids(catalog, sql, params, 1,
+										   oids, count);
+}
+
+
+/*
  * catalog_s_table_fetch_attrs fetches the table SourceTableAttribute array
  * from our s_attr catalog.
  */
@@ -10349,6 +11299,9 @@ catalog_delete_source_schema_data(DatabaseCatalog *catalog)
 	static char *sqls[] = {
 		/* delete in FK-safe order: dependents first, then referenced tables */
 		"delete from summary",
+		"delete from fk_validation_summary",
+		"delete from fk_constraint_summary",
+		"delete from s_fk_constraint",
 		"delete from s_table_parts_done",
 		"delete from s_table_indexes_done",
 		"delete from vacuum_summary",

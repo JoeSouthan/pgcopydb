@@ -72,7 +72,12 @@ bool catalog_register_setup(DatabaseCatalog *catalog,
 							const char *snapshot,
 							uint64_t splitTablesLargerThanBytes,
 							int splitMaxParts,
-							const char *filters);
+							const char *filters,
+							bool claimDeferValidateFKs,
+							bool deferValidateFKs);
+
+bool catalog_update_defer_validate_fks(DatabaseCatalog *catalog,
+									   bool deferValidateFKs);
 
 bool catalog_setup_replication(DatabaseCatalog *catalog, const char *snapshot);
 
@@ -110,7 +115,10 @@ typedef enum
 	TIMING_SECTION_SET_SEQUENCES,
 	TIMING_SECTION_LARGE_OBJECTS,
 	TIMING_SECTION_FINALIZE_SCHEMA,
-	TIMING_SECTION_TOTAL
+	TIMING_SECTION_TOTAL,
+
+	/* appended after TOTAL so that the on-disk ids above do not change */
+	TIMING_SECTION_VALIDATE_FKS
 } TimingSection;
 
 #define TIMING_SINGLE_JOB 1
@@ -145,6 +153,9 @@ void catalog_stop_timing(TopLevelTiming *timing);
 bool catalog_register_section(DatabaseCatalog *catalog, TopLevelTiming *timing);
 
 bool catalog_section_state(DatabaseCatalog *catalog, CatalogSection *section);
+bool catalog_section_is_fetched(DatabaseCatalog *catalog,
+								const char *name,
+								bool *fetched);
 bool catalog_section_fetch(SQLiteQuery *query);
 bool catalog_total_duration(DatabaseCatalog *catalog);
 
@@ -424,6 +435,47 @@ bool catalog_iter_s_index_next(SourceIndexIterator *iter);
 bool catalog_iter_s_index_finish(SourceIndexIterator *iter);
 
 bool catalog_s_index_fetch(SQLiteQuery *query);
+
+/*
+ * Foreign keys, for --defer-validate-fks
+ */
+bool catalog_add_s_fk_constraint(DatabaseCatalog *catalog,
+								 SourceFKConstraint *fk);
+
+bool catalog_lookup_s_fk_constraint_by_oid(DatabaseCatalog *catalog,
+										   SourceFKConstraint *fk,
+										   uint32_t oid);
+
+typedef bool (SourceFKConstraintIterFun)(void *context, SourceFKConstraint *fk);
+
+bool catalog_iter_s_fk_constraint(DatabaseCatalog *catalog,
+								  void *context,
+								  SourceFKConstraintIterFun *callback);
+
+typedef struct SourceFKConstraintIterator
+{
+	DatabaseCatalog *catalog;
+	SourceFKConstraint row;
+	SourceFKConstraint *fk;     /* NULL once the iteration is done */
+	SQLiteQuery query;
+} SourceFKConstraintIterator;
+
+bool catalog_iter_s_fk_constraint_init(SourceFKConstraintIterator *iter);
+bool catalog_iter_s_fk_constraint_next(SourceFKConstraintIterator *iter);
+bool catalog_iter_s_fk_constraint_finish(SourceFKConstraintIterator *iter);
+
+bool catalog_s_fk_constraint_fetch(SQLiteQuery *query);
+
+bool catalog_count_fk_validation(DatabaseCatalog *catalog, int *pending, int *failed);
+
+bool catalog_list_fk_validation_pending_tables(DatabaseCatalog *catalog,
+											   uint32_t **reloids,
+											   int *count);
+
+bool catalog_list_fk_validation_pending_by_table(DatabaseCatalog *catalog,
+												 uint32_t reloid,
+												 uint32_t **oids,
+												 int *count);
 
 /*
  * Sequences

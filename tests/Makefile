@@ -9,7 +9,8 @@ all: pagila pagila-multi-steps blobs unit filtering extensions \
 	 partitioned-target all-databases \
 	 cdc-wal2json cdc-test-decoding cdc-endpos-mid-txn cdc-low-level \
 	 cdc-replica-identity-index cdc-partitioned-target cdc-matview \
-	 cdc-endpos-in-multi-wal-txn cdc-file-rotation cdc-file-rotation-live cdc-concurrent-backlog cdc-copy-multi-insert cdc-origin-abort \
+	 cdc-endpos-in-multi-wal-txn cdc-file-rotation cdc-file-rotation-live cdc-concurrent-backlog cdc-copy-multi-insert cdc-origin-abort defer-validate-fks \
+	 follow-defer-validate-fks \
 	 cdc-pgoutput cdc-filtering-pgoutput \
 	 follow-wal2json follow-9.6 follow-data-only \
 	 follow-pgoutput follow-filtering \
@@ -95,6 +96,12 @@ cdc-copy-multi-insert: build
 cdc-origin-abort: build
 	$(MAKE) -C $@
 
+defer-validate-fks: build
+	$(MAKE) -C $@
+
+follow-defer-validate-fks: build
+	$(MAKE) -C $@
+
 cdc-pgoutput: build
 	$(MAKE) -C $@
 
@@ -171,6 +178,7 @@ clean-images:
 .PHONY: all-databases three-databases
 .PHONY: cdc-wal2json cdc-test-decoding cdc-endpos-mid-txn cdc-low-level cdc-replica-identity-index cdc-partitioned-target
 .PHONY: cdc-endpos-in-multi-wal-txn cdc-file-rotation cdc-file-rotation-live cdc-concurrent-backlog cdc-copy-multi-insert cdc-origin-abort
+.PHONY: defer-validate-fks follow-defer-validate-fks
 .PHONY: cdc-pgoutput cdc-filtering-pgoutput follow-pgoutput follow-filtering
 .PHONY: follow-wal2json follow-9.6
 .PHONY: follow-endpos-tail follow-endpos-quiet-tail follow-ddl-message-stall
