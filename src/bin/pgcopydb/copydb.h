@@ -694,6 +694,10 @@ bool summary_add_table_parts_done(DatabaseCatalog *catalog,
 bool summary_lookup_table_parts_done(DatabaseCatalog *catalog,
 									 CopyTableDataSpec *tableSpecs);
 
+bool summary_reclaim_table_parts_done(DatabaseCatalog *catalog,
+									  CopyTableDataSpec *tableSpecs,
+									  int stalePid);
+
 bool summary_table_parts_done_fetch(SQLiteQuery *query);
 
 bool summary_add_vacuum(DatabaseCatalog *catalog,

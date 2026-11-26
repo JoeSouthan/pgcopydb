@@ -1384,6 +1384,31 @@ copydb_table_parts_are_all_done(CopyDataSpec *specs,
 			return false;
 		}
 
+		/*
+		 * On --resume the row may still name the worker of the interrupted
+		 * run that first saw all the parts done. When that pid is neither
+		 * ours nor a live process, the indexes of the table might never have
+		 * been queued: reclaim the row so that this worker queues them. The
+		 * indexes that are done already are skipped by the index workers.
+		 */
+		int stalePid = tableSpecs->partsDonePid;
+
+		if (stalePid > 0 && stalePid != getpid() && kill(stalePid, 0) != 0)
+		{
+			log_notice("Found stale pid %d holding the indexes of table %s, "
+					   "reclaiming it",
+					   stalePid,
+					   tableSpecs->sourceTable->qname);
+
+			if (!summary_reclaim_table_parts_done(sourceDB, tableSpecs,
+												  stalePid) ||
+				!summary_lookup_table_parts_done(sourceDB, tableSpecs))
+			{
+				/* errors have already been logged */
+				return false;
+			}
+		}
+
 		/* set isBeingProcessed to false to allow processing indexes */
 		*isBeingProcessed = (tableSpecs->partsDonePid != getpid());
 	}

@@ -834,6 +834,74 @@ summary_add_table_parts_done(DatabaseCatalog *catalog,
 
 
 /*
+ * summary_reclaim_table_parts_done hands the s_table_parts_done row of a
+ * table over to the current process when it still holds the given pid, the
+ * one of a worker that died. Only one of the workers that race for it gets
+ * it: the others no longer match the stale pid.
+ */
+bool
+summary_reclaim_table_parts_done(DatabaseCatalog *catalog,
+								 CopyTableDataSpec *tableSpecs,
+								 int stalePid)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_reclaim_table_parts_done: db is NULL");
+		return false;
+	}
+
+	SourceTable *table = tableSpecs->sourceTable;
+
+	char *sql =
+		"update s_table_parts_done set pid = $1 "
+		" where tableoid = $2 and pid = $3";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "pid", getpid(), NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "tableoid", table->oid, NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "stalepid", stalePid, NULL }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
  * summary_lookup_table_parts_done selects the PID that went there first.
  *
  * We could use insert or ignore ... returning ... but that's supported by

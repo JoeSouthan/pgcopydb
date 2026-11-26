@@ -8,6 +8,10 @@
 #
 #  - split: tables copied in several parts, all done, and no foreign key on
 #    the target yet to prevent a TRUNCATE;
+#  - constraints: a worker killed while it held a table's "parts done" or
+#    "indexes done" claim, a CREATE INDEX and an ALTER TABLE ADD CONSTRAINT
+#    that the server finished after pgcopydb had gone, and a constraint whose
+#    index was built but not the constraint itself;
 #  - postdata: a post-data restore that went through but was not recorded as
 #    done, with the foreign keys that --defer-validate-fks creates after it
 #    never reached.
@@ -26,6 +30,9 @@ admin_uri="${PGCOPYDB_TARGET_PGURI}"
 opts="--table-jobs 2 --index-jobs 2 --split-tables-larger-than 64kB"
 opts="${opts} --defer-validate-fks --notice"
 
+# a pid that no process has
+stale_pid=4194000
+
 src() {
     psql -AtqX -d "${PGCOPYDB_SOURCE_PGURI}" -c "$1"
 }
@@ -43,7 +50,26 @@ catalog_edit() {
     sqlite3 -bail -init /dev/null -batch "${dir}/schema/source.db" "$1"
 }
 
-# timings ids: 11 finalize schema (post-data), 12 total
+# index_oid <index name>, constraint_oid <constraint name>, table_oid <name>
+index_oid() {
+    catalog_sql "select oid from s_index where relname = '$1'"
+}
+
+constraint_oid() {
+    catalog_sql "select oid from s_constraint where conname = '$1'"
+}
+
+table_oid() {
+    catalog_sql "select oid from s_table where relname = '$1'"
+}
+
+# timings ids: 4 total data, 6 create index, 7 alter table, 8 vacuum,
+# 11 finalize schema (post-data), 12 total
+interrupt_index_phase() {
+    catalog_edit "update timings set done_time_epoch = null, duration = null
+                   where id in (4, 6, 7, 8, 11, 12)"
+}
+
 interrupt_post_data() {
     catalog_edit "update timings set done_time_epoch = null, duration = null
                    where id in (11, 12)"
@@ -154,6 +180,49 @@ scenario_split() {
     test ${rc} -eq 0
 }
 
+# indexes and constraints left in flight, or never started, by the previous
+# run
+scenario_constraints() {
+    setup constraints
+    interrupt_index_phase
+
+    # the worker that queued the indexes of split_t was killed while
+    # split_t_pad was being built, and the server finished building it
+    catalog_edit "update s_table_parts_done set pid = ${stale_pid}
+                   where tableoid = $(table_oid split_t);
+                  update summary
+                     set pid = ${stale_pid}, done_time_epoch = null,
+                         duration = null
+                   where indexoid = $(index_oid split_t_pad);
+                  delete from s_table_indexes_done
+                   where tableoid = $(table_oid split_t);
+                  delete from summary
+                   where conoid = $(constraint_oid split_t_pkey)"
+    tgt "alter table split_t drop constraint split_t_pkey;
+         create unique index split_t_pkey on split_t(id)"
+
+    # the worker that claimed the constraints of con_a was killed before it
+    # started them: the index is there, not the constraint
+    catalog_edit "update s_table_indexes_done set pid = ${stale_pid}
+                   where tableoid = $(table_oid con_a);
+                  delete from summary
+                   where conoid = $(constraint_oid con_a_pkey)"
+    tgt "alter table con_a drop constraint con_a_pkey;
+         create unique index con_a_pkey on con_a(id)"
+
+    # the worker was killed during ALTER TABLE con_b ADD CONSTRAINT
+    # con_b_r_key, and the server finished it
+    catalog_edit "update summary
+                     set pid = ${stale_pid}, done_time_epoch = null,
+                         duration = null
+                   where conoid = $(constraint_oid con_b_r_key);
+                  delete from s_table_indexes_done
+                   where tableoid = $(table_oid con_b)"
+
+    resume
+    check_complete
+}
+
 # the post-data restore went through, but the run failed before it was
 # recorded as done, and before the foreign keys were created
 scenario_postdata() {
@@ -173,7 +242,7 @@ scenario_postdata() {
 
 failed=""
 
-for s in ${SCENARIOS:-split postdata}; do
+for s in ${SCENARIOS:-split constraints postdata}; do
     set +e
     (set -e; scenario_${s})
     rc=$?
