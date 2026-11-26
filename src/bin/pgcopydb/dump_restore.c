@@ -113,18 +113,37 @@ copydb_dump_source_schema(CopyDataSpec *specs,
 		return false;
 	}
 
+	/*
+	 * The schema dump is only known to be complete once its timing section is
+	 * done, which we checked above. A file left without it comes from a
+	 * pg_dump that was killed while it was writing, and pg_restore cannot read
+	 * a truncated archive: dump the schema again.
+	 */
 	if (file_exists(specs->dumpPaths.dumpFilename))
 	{
-		log_info("Skipping source schema dump, "
-				 "as \"%s\" already exists",
-				 specs->dumpPaths.dumpFilename);
+		log_notice("Removing \"%s\" left by a schema dump that did not "
+				   "finish, dumping the schema again",
+				   specs->dumpPaths.dumpFilename);
+
+		if (!unlink_file(specs->dumpPaths.dumpFilename))
+		{
+			/* errors have already been logged */
+			return false;
+		}
 	}
-	else if (!pg_dump_db(&(specs->pgPaths),
-						 &(specs->connStrings),
-						 snapshot,
-						 &(specs->filters),
-						 &(specs->catalogs.filter),
-						 specs->dumpPaths.dumpFilename))
+
+	/*
+	 * With --not-consistent there is no snapshot to dump in: the one a
+	 * --resume finds in the catalogs belongs to a process that is gone.
+	 */
+	const char *dumpSnapshot = specs->consistent ? snapshot : "";
+
+	if (!pg_dump_db(&(specs->pgPaths),
+					&(specs->connStrings),
+					dumpSnapshot,
+					&(specs->filters),
+					&(specs->catalogs.filter),
+					specs->dumpPaths.dumpFilename))
 	{
 		/* errors have already been logged */
 		return false;

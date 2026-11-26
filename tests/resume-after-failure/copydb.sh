@@ -16,7 +16,9 @@
 #    an older pgcopydb;
 #  - postdata: a post-data restore that went through but was not recorded as
 #    done, with the foreign keys that --defer-validate-fks creates after it
-#    never reached.
+#    never reached;
+#  - dump: a pg_dump killed while it wrote the schema dump, which leaves a
+#    truncated archive behind.
 
 set -x -e -o pipefail
 
@@ -77,6 +79,26 @@ interrupt_post_data() {
                    where id in (11, 12)"
 }
 
+# the state of a run killed before any of its work after the catalogs was
+# recorded as done: timings from the given id on are not done, and the
+# summaries of the COPY, CREATE INDEX, constraints and VACUUM are empty
+reset_after() {
+    catalog_edit "update timings set done_time_epoch = null, duration = null
+                   where id >= $1;
+                  delete from summary;
+                  delete from s_table_parts_done;
+                  delete from s_table_indexes_done;
+                  delete from vacuum_summary;
+                  delete from fk_validation_summary;
+                  delete from fk_constraint_summary"
+}
+
+# an empty target database, named after the scenario
+empty_target() {
+    psql -d "${admin_uri}" -c "drop database if exists ${name}" \
+         -c "create database ${name}"
+}
+
 setup() {
     name=$1
     dir=/tmp/${name}
@@ -93,6 +115,7 @@ resume() {
          > "/tmp/${name}-resume.log" 2>&1
     then
         grep -E 'ERROR|FATAL|line ignored|indexes .supporting|Found [0-9]+ indexes on target' "/tmp/${name}-resume.log" | head -40
+        tail -n 40 "/tmp/${name}-resume.log"
         return 1
     fi
 }
@@ -280,9 +303,23 @@ scenario_postdata() {
     check_complete
 }
 
+# pg_dump was killed while it wrote the schema dump: the archive is
+# truncated and its timing section is not done, and nothing after it ran
+scenario_dump() {
+    setup dump
+    reset_after 2
+    empty_target
+
+    head -c 100 "${dir}/schema/schema.dump" > "${dir}/schema/schema.dump.part"
+    mv "${dir}/schema/schema.dump.part" "${dir}/schema/schema.dump"
+
+    resume
+    check_complete
+}
+
 failed=""
 
-for s in ${SCENARIOS:-split vacuum constraints postdata}; do
+for s in ${SCENARIOS:-split vacuum constraints postdata dump}; do
     set +e
     (set -e; scenario_${s})
     rc=$?
