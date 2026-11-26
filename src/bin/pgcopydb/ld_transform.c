@@ -340,18 +340,53 @@ stream_transform_cdc_file_hook(StreamSpecs *specs,
 {
 	CopyDBSentinel *sentinel = &(specs->sentinel);
 
-	/* parse the logical decoding output */
-	if (!stream_transform_prepare_message(specs, output))
+	/*
+	 * A KEEPALIVE or SWITCH marker can come while the transform holds a
+	 * transaction that receive has not written the COMMIT of yet: the
+	 * transaction stays in memory from one pass to the next, and markers have
+	 * a cursor of their own. When receive sends the transaction again after a
+	 * reconnect, its rows take new ids and a marker written before them comes
+	 * first. A marker is not part of any transaction: write it on its own, and
+	 * keep the transaction we hold for the pass that reaches its COMMIT.
+	 */
+	if (specs->private.currentMsg.isTransaction &&
+		(output->action == STREAM_ACTION_KEEPALIVE ||
+		 output->action == STREAM_ACTION_SWITCH))
 	{
-		/* errors have already been logged */
-		return false;
-	}
+		ReplayDBStmt marker = {
+			.action = output->action,
+			.lsn = output->lsn
+		};
 
-	/* insert the message into the SQLite replayDB (stmt, replay) */
-	if (!stream_transform_write_transaction(specs))
+		strlcpy(marker.timestamp, output->timestamp, sizeof(marker.timestamp));
+
+		log_debug("stream_transform_cdc_file_hook: %c at %X/%X while "
+				  "transaction %u is open",
+				  output->action,
+				  LSN_FORMAT_ARGS(output->lsn),
+				  specs->private.currentMsg.command.tx.xid);
+
+		if (!ld_store_insert_replay_stmt(specs->replayDB, &marker))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+	}
+	else
 	{
-		/* errors have already been logged */
-		return false;
+		/* parse the logical decoding output */
+		if (!stream_transform_prepare_message(specs, output))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		/* insert the message into the SQLite replayDB (stmt, replay) */
+		if (!stream_transform_write_transaction(specs))
+		{
+			/* errors have already been logged */
+			return false;
+		}
 	}
 
 	/* track progress at this message's LSN */

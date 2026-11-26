@@ -14,7 +14,7 @@ all: pagila pagila-multi-steps blobs unit filtering extensions \
 	 cdc-pgoutput cdc-filtering-pgoutput \
 	 follow-wal2json follow-9.6 follow-data-only \
 	 follow-pgoutput follow-filtering split-table-resume \
-	 orphaned-target-backend orphaned-target-ddl cdc-receive-drain-error \
+	 orphaned-target-backend orphaned-target-ddl cdc-receive-drain-error cdc-keepalive-open-txn \
 	 toc-coverage;
 
 # Unlike every other test target, this needs no docker image and no
@@ -165,6 +165,9 @@ orphaned-target-backend: build
 orphaned-target-ddl: build
 	$(MAKE) -C $@
 
+cdc-keepalive-open-txn: build
+	$(MAKE) -C $@
+
 cdc-receive-drain-error: build
 	$(MAKE) -C $@
 
@@ -208,7 +211,7 @@ clean-images:
 .PHONY: cdc-endpos-in-multi-wal-txn cdc-file-rotation cdc-file-rotation-live cdc-concurrent-backlog cdc-copy-multi-insert cdc-origin-abort
 .PHONY: defer-validate-fks follow-defer-validate-fks resume-after-failure follow-catalog-lock-race
 .PHONY: cdc-pgoutput cdc-filtering-pgoutput follow-pgoutput follow-filtering
-.PHONY: follow-wal2json follow-9.6 split-table-resume orphaned-target-backend orphaned-target-ddl cdc-receive-status-interval cdc-receive-reconnect-dying-source cdc-receive-drain-error
+.PHONY: follow-wal2json follow-9.6 split-table-resume orphaned-target-backend orphaned-target-ddl cdc-receive-status-interval cdc-receive-reconnect-dying-source cdc-receive-drain-error cdc-keepalive-open-txn
 .PHONY: follow-endpos-tail follow-endpos-quiet-tail follow-ddl-message-stall
 .PHONY: follow-restart follow-restart-rotation
 .PHONY: cdc-interleaved-commits cdc-commit-order-resume

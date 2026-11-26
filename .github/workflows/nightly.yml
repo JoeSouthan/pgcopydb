@@ -121,6 +121,7 @@ jobs:
           - split-table-resume
           - orphaned-target-backend
           - orphaned-target-ddl
+          - cdc-keepalive-open-txn
           - cdc-receive-status-interval
           - cdc-receive-reconnect-dying-source
           - cdc-receive-drain-error
