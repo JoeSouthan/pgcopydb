@@ -145,6 +145,7 @@ jobs:
           - cdc-origin-abort
           - defer-validate-fks
           - follow-defer-validate-fks
+          - follow-catalog-lock-race
           - follow-restart-rotation
           - cdc-interleaved-commits
           - cdc-commit-order-resume

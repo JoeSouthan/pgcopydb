@@ -23,7 +23,8 @@
 
 
 static bool copydb_add_table_indexes_hook(void *context, SourceIndex *index);
-static bool copydb_create_constraints_hook(void *context, SourceIndex *index);
+static bool copydb_collect_constraint_oids_hook(void *context,
+												SourceIndex *index);
 static bool copydb_copy_all_indexes_hook(void *ctx, SourceIndex *index);
 
 
@@ -1226,6 +1227,15 @@ typedef struct CreateConstraintsContext
 	PGSQL *dst;
 } CreateConstraintsContext;
 
+typedef struct CollectConstraintsContext
+{
+	IndexOIDArray *indexArray;
+	int capacity;
+} CollectConstraintsContext;
+
+static bool copydb_create_constraint(CreateConstraintsContext *context,
+									 SourceIndex *index);
+
 /*
  * copydb_create_constraints loops over the index definitions for a given table
  * and creates all the associated constraints, one after the other.
@@ -1297,27 +1307,130 @@ copydb_create_constraints(CopyDataSpec *specs, PGSQL *dst, SourceTable *table)
 		.dst = dst
 	};
 
-	if (!catalog_iter_s_index_table(sourceDB,
-									table->nspname,
-									table->relname,
-									&context,
-									&copydb_create_constraints_hook))
+	/*
+	 * Collect the OIDs of the indexes that back a constraint first, and
+	 * create the constraints once the iteration is over.
+	 *
+	 * The iterator keeps a SQLite read transaction open on the source catalog
+	 * until it is done, and creating a constraint records its progress in the
+	 * same catalog, from the same connection. The follow process commits to
+	 * that catalog meanwhile (cdc_files rows at every CDC file rotation), and
+	 * once another connection has committed, SQLite refuses to upgrade the
+	 * read transaction to a write one: SQLITE_BUSY_SNAPSHOT, reported as
+	 * "database is locked", which waiting does not fix. It also kept the
+	 * catalog semaphore for as long as the ALTER TABLE commands ran.
+	 */
+	if (!catalog_s_table_count_indexes(sourceDB, table))
 	{
 		/* errors have already been logged */
 		return false;
 	}
+
+	IndexOIDArray indexArray = { 0, NULL };
+
+	indexArray.array =
+		(uint32_t *) calloc(table->indexCount + 1, sizeof(uint32_t));
+
+	if (indexArray.array == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	CollectConstraintsContext collect = {
+		.indexArray = &indexArray,
+		.capacity = table->indexCount
+	};
+
+	if (!catalog_iter_s_index_table(sourceDB,
+									table->nspname,
+									table->relname,
+									&collect,
+									&copydb_collect_constraint_oids_hook))
+	{
+		/* errors have already been logged */
+		free(indexArray.array);
+		return false;
+	}
+
+	SourceIndex *index = (SourceIndex *) calloc(1, sizeof(SourceIndex));
+
+	if (index == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		free(indexArray.array);
+		return false;
+	}
+
+	for (int i = 0; i < indexArray.count; i++)
+	{
+		bool success =
+			catalog_lookup_s_index(sourceDB, indexArray.array[i], index) &&
+			copydb_create_constraint(&context, index);
+
+		free(index->indexColumns);
+		free(index->indexDef);
+		free(index->constraintDef);
+		*index = (SourceIndex) {
+			0
+		};
+
+		if (!success)
+		{
+			log_error("Failed to create the constraint of index %u "
+					  "on table %s",
+					  indexArray.array[i],
+					  table->qname);
+			free(index);
+			free(indexArray.array);
+			return false;
+		}
+	}
+
+	free(index);
+	free(indexArray.array);
 
 	return errors == 0;
 }
 
 
 /*
- * copydb_create_constraints_hook is an iterator callback function.
+ * copydb_collect_constraint_oids_hook is an iterator callback function. It
+ * keeps the OID of the indexes that are attached to a constraint.
  */
 static bool
-copydb_create_constraints_hook(void *ctx, SourceIndex *index)
+copydb_collect_constraint_oids_hook(void *ctx, SourceIndex *index)
 {
-	CreateConstraintsContext *context = (CreateConstraintsContext *) ctx;
+	CollectConstraintsContext *context = (CollectConstraintsContext *) ctx;
+	IndexOIDArray *indexArray = context->indexArray;
+
+	/* some indexes are not attached to a constraint at all */
+	if (index->constraintOid == 0 ||
+		IS_EMPTY_STRING_BUFFER(index->constraintName))
+	{
+		return true;
+	}
+
+	if (indexArray->count >= context->capacity)
+	{
+		log_error("BUG: more indexes than the %d we counted for the table",
+				  context->capacity);
+		return false;
+	}
+
+	indexArray->array[(indexArray->count)++] = index->indexOid;
+
+	return true;
+}
+
+
+/*
+ * copydb_create_constraint creates the constraint that is attached to the
+ * given index, unless it is already there.
+ */
+static bool
+copydb_create_constraint(CreateConstraintsContext *context, SourceIndex *index)
+{
 	CopyDataSpec *specs = context->specs;
 
 	DatabaseCatalog *sourceDB = &(specs->catalogs.source);
