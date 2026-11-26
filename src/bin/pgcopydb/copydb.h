@@ -706,6 +706,12 @@ bool summary_add_vacuum(DatabaseCatalog *catalog,
 bool summary_finish_vacuum(DatabaseCatalog *catalog,
 						   CopyTableDataSpec *tableSpecs);
 
+bool summary_vacuum_is_done(DatabaseCatalog *catalog,
+							uint32_t tableOid,
+							bool *isDone);
+
+bool summary_vacuum_is_done_fetch(SQLiteQuery *query);
+
 /*
  * Summary for Create Index and Constraints
  */

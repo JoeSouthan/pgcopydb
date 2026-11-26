@@ -8,6 +8,7 @@
 #
 #  - split: tables copied in several parts, all done, and no foreign key on
 #    the target yet to prevent a TRUNCATE;
+#  - vacuum: tables vacuumed by the previous run, and one VACUUM in flight;
 #  - constraints: a worker killed while it held a table's "parts done" or
 #    "indexes done" claim, a CREATE INDEX and an ALTER TABLE ADD CONSTRAINT
 #    that the server finished after pgcopydb had gone, and a constraint whose
@@ -180,6 +181,30 @@ scenario_split() {
     test ${rc} -eq 0
 }
 
+# VACUUM: the tables vacuumed by the previous run are not vacuumed again, and
+# the one in flight is
+scenario_vacuum() {
+    setup vacuum
+    interrupt_index_phase
+
+    catalog_edit "update vacuum_summary
+                     set pid = ${stale_pid}, done_time_epoch = null,
+                         duration = null
+                   where tableoid = $(table_oid plain_t)"
+
+    local before
+    before=$(catalog_sql "select group_concat(tableoid || ':' || start_time_epoch)
+                            from vacuum_summary
+                           where tableoid <> $(table_oid plain_t)")
+
+    resume
+    check_complete
+
+    test "$(catalog_sql "select group_concat(tableoid || ':' || start_time_epoch)
+                           from vacuum_summary
+                          where tableoid <> $(table_oid plain_t)")" = "${before}"
+}
+
 # indexes and constraints left in flight, or never started, by the previous
 # run
 scenario_constraints() {
@@ -242,7 +267,7 @@ scenario_postdata() {
 
 failed=""
 
-for s in ${SCENARIOS:-split constraints postdata}; do
+for s in ${SCENARIOS:-split vacuum constraints postdata}; do
     set +e
     (set -e; scenario_${s})
     rc=$?

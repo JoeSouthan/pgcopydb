@@ -1073,6 +1073,87 @@ summary_add_vacuum(DatabaseCatalog *catalog, CopyTableDataSpec *tableSpecs)
 
 
 /*
+ * summary_vacuum_is_done sets isDone to true when a previous run has already
+ * vacuumed the given table.
+ */
+bool
+summary_vacuum_is_done(DatabaseCatalog *catalog, uint32_t tableOid, bool *isDone)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_vacuum_is_done: db is NULL");
+		return false;
+	}
+
+	char *sql =
+		"select count(*) from vacuum_summary "
+		" where tableoid = $1 and done_time_epoch is not null";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	int count = 0;
+
+	SQLiteQuery query = {
+		.context = &count,
+		.fetchFunction = &summary_vacuum_is_done_fetch
+	};
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "tableoid", tableOid, NULL }
+	};
+
+	int paramCount = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, paramCount))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	*isDone = count > 0;
+
+	return true;
+}
+
+
+/*
+ * summary_vacuum_is_done_fetch fetches the count of summary_vacuum_is_done.
+ */
+bool
+summary_vacuum_is_done_fetch(SQLiteQuery *query)
+{
+	int *count = (int *) query->context;
+
+	*count = sqlite3_column_int(query->ppStmt, 0);
+
+	return true;
+}
+
+
+/*
  * summary_finish_vacuum UPDATEs a SourceTable vacuum summary entry to our
  * internal catalogs database.
  */
