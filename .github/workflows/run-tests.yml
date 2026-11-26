@@ -145,6 +145,7 @@ jobs:
           - cdc-origin-abort
           - defer-validate-fks
           - follow-defer-validate-fks
+          - resume-after-failure
           - follow-restart-rotation
           - cdc-interleaved-commits
           - cdc-commit-order-resume
@@ -203,6 +204,8 @@ jobs:
           - TEST: defer-validate-fks
             PGVERSION: 16
           - TEST: follow-defer-validate-fks
+            PGVERSION: 16
+          - TEST: resume-after-failure
             PGVERSION: 16
     steps:
       - name: Checkout repository
