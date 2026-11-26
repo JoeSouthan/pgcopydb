@@ -12,7 +12,8 @@
 #  - constraints: a worker killed while it held a table's "parts done" or
 #    "indexes done" claim, a CREATE INDEX and an ALTER TABLE ADD CONSTRAINT
 #    that the server finished after pgcopydb had gone, and a constraint whose
-#    index was built but not the constraint itself;
+#    index was built but not the constraint itself, with a catalog written by
+#    an older pgcopydb;
 #  - postdata: a post-data restore that went through but was not recorded as
 #    done, with the foreign keys that --defer-validate-fks creates after it
 #    never reached.
@@ -244,8 +245,22 @@ scenario_constraints() {
                   delete from s_table_indexes_done
                    where tableoid = $(table_oid con_b)"
 
+    # a catalog written by an older pgcopydb: no unique summary_conoid
+    # index, and a second row for the constraint in flight
+    catalog_edit "drop index summary_conoid;
+                  insert into summary(pid, conoid, start_time_epoch, command)
+                  select pid, conoid, start_time_epoch, command
+                    from summary
+                   where conoid = $(constraint_oid con_b_r_key)"
+
     resume
     check_complete
+
+    test "$(catalog_sql "select count(*) from sqlite_master
+                          where type = 'index'
+                            and name = 'summary_conoid'")" = 1
+    test "$(catalog_sql "select count(*) from summary
+                          where conoid = $(constraint_oid con_b_r_key)")" = 1
 }
 
 # the post-data restore went through, but the run failed before it was
