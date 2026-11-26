@@ -18,7 +18,9 @@
 #    done, with the foreign keys that --defer-validate-fks creates after it
 #    never reached;
 #  - dump: a pg_dump killed while it wrote the schema dump, which leaves a
-#    truncated archive behind.
+#    truncated archive behind;
+#  - predata: a pre-data restore killed half-way, which leaves some tables,
+#    a function and a detached partition on the target.
 
 set -x -e -o pipefail
 
@@ -317,9 +319,26 @@ scenario_dump() {
     check_complete
 }
 
+# the pre-data restore was killed half-way: some of its objects are on the
+# target, a partition is there but not attached, and other tables are not
+scenario_predata() {
+    setup predata
+    reset_after 3
+    empty_target
+
+    pg_restore -d "${PGCOPYDB_TARGET_PGURI}" --section pre-data \
+               --no-owner --no-acl "${dir}/schema/schema.dump"
+    tgt "alter table pt detach partition pt_2026;
+         drop table plain_t;
+         drop table con_b"
+
+    resume
+    check_complete
+}
+
 failed=""
 
-for s in ${SCENARIOS:-split vacuum constraints postdata dump}; do
+for s in ${SCENARIOS:-split vacuum constraints postdata dump predata}; do
     set +e
     (set -e; scenario_${s})
     rc=$?

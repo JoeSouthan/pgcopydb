@@ -728,17 +728,19 @@ copydb_fetch_reserved_oids(CopyDataSpec *specs, PgcopydbReservedOids *oids)
 
 
 /*
- * A post-data restore is not safe to run twice: CREATE INDEX, CREATE TRIGGER,
- * ALTER TABLE ADD CONSTRAINT and the like fail when the object exists, and
- * pg_restore then exits with an error. A run that failed during, or after,
- * the post-data restore leaves those objects on the target, and its --resume
- * would fail on each of them, every time.
+ * Neither a pre-data nor a post-data restore is safe to run twice: CREATE
+ * TABLE, CREATE TYPE, CREATE FUNCTION, CREATE INDEX, CREATE TRIGGER, ALTER
+ * TABLE ADD CONSTRAINT, ALTER TABLE ATTACH PARTITION and the like fail when
+ * the object exists, and pg_restore then exits with an error. A run that
+ * failed during, or after, one of these restores leaves those objects on the
+ * target, and its --resume would fail on each of them, every time.
  *
  * On --resume we look the objects of these entries up on the target, by the
  * identity of the source object (pg_identify_object), and leave out of the
- * restore list the ones that exist already. The other post-data entries
- * (ACL, COMMENT, INDEX ATTACH, ROW SECURITY, REFRESH MATERIALIZED VIEW) can
- * run again.
+ * restore list the ones that exist already. The other entries (ACL, COMMENT,
+ * DEFAULT, SEQUENCE OWNED BY, INDEX ATTACH, ROW SECURITY, REFRESH MATERIALIZED
+ * VIEW) can run again. The objects that the remaining entries depend on were
+ * created by the previous run, or are created by this one.
  */
 static bool
 copydb_restore_item_may_exist(ArchiveContentItem *item)
@@ -750,6 +752,25 @@ copydb_restore_item_may_exist(ArchiveContentItem *item)
 
 	switch (item->desc)
 	{
+		/* pre-data */
+		case ARCHIVE_TAG_TABLE:
+		case ARCHIVE_TAG_TABLE_ATTACH:
+		case ARCHIVE_TAG_SEQUENCE:
+		case ARCHIVE_TAG_VIEW:
+		case ARCHIVE_TAG_MATERIALIZED_VIEW:
+		case ARCHIVE_TAG_FOREIGN_TABLE:
+		case ARCHIVE_TAG_TYPE:
+		case ARCHIVE_TAG_SHELL_TYPE:
+		case ARCHIVE_TAG_DOMAIN:
+		case ARCHIVE_TAG_FUNCTION:
+		case ARCHIVE_TAG_PROCEDURE:
+		case ARCHIVE_TAG_AGGREGATE:
+		case ARCHIVE_TAG_COLLATION:
+		case ARCHIVE_TAG_OPERATOR:
+		case ARCHIVE_TAG_TEXT_SEARCH_CONFIGURATION:
+		case ARCHIVE_TAG_TEXT_SEARCH_DICTIONARY:
+
+		/* post-data */
 		case ARCHIVE_TAG_INDEX:
 		case ARCHIVE_TAG_CONSTRAINT:
 		case ARCHIVE_TAG_FK_CONSTRAINT:
@@ -773,6 +794,22 @@ copydb_restore_item_may_exist(ArchiveContentItem *item)
 }
 
 
+/*
+ * The catalog an entry is looked up with. A partition exists on the target as
+ * soon as its CREATE TABLE has run: what TABLE ATTACH needs to know is whether
+ * it is attached, which we look up as pg_inherits.
+ */
+#define PG_INHERITS_RELATION_OID 2611
+
+static uint32_t
+copydb_restore_item_catalog(ArchiveContentItem *item)
+{
+	return item->desc == ARCHIVE_TAG_TABLE_ATTACH
+		   ? PG_INHERITS_RELATION_OID
+		   : item->catalogOid;
+}
+
+
 typedef struct RestoreItemOids
 {
 	int count;
@@ -789,7 +826,8 @@ copydb_collect_restore_item_oids_hook(void *ctx, ArchiveContentItem *item)
 	if (copydb_restore_item_may_exist(item))
 	{
 		appendPQExpBuffer(oids->catalogOids, "%s%u",
-						  oids->count == 0 ? "" : ",", item->catalogOid);
+						  oids->count == 0 ? "" : ",",
+						  copydb_restore_item_catalog(item));
 		appendPQExpBuffer(oids->objectOids, "%s%u",
 						  oids->count == 0 ? "" : ",", item->objectOid);
 		++(oids->count);
@@ -919,6 +957,7 @@ cmp_uint64(const void *a, const void *b)
  */
 static bool
 copydb_fetch_existing_restore_items(CopyDataSpec *specs,
+									const char *sectionName,
 									const char *listOutFilename,
 									RestoreListExisting *existing)
 {
@@ -967,7 +1006,11 @@ copydb_fetch_existing_restore_items(CopyDataSpec *specs,
 
 	char *sourceSQL =
 		"select t.classid, t.objid, "
-		"       (pg_identify_object(t.classid, t.objid, 0)).identity "
+		"       case when t.classid = 'pg_inherits'::regclass "
+		"            then (pg_identify_object('pg_class'::regclass, "
+		"                                     t.objid, 0)).identity "
+		"            else (pg_identify_object(t.classid, t.objid, 0)).identity "
+		"        end "
 		"  from unnest($1::oid[], $2::oid[]) as t(classid, objid)";
 
 	Oid sourceTypes[2] = { TEXTOID, TEXTOID };
@@ -1006,7 +1049,22 @@ copydb_fetch_existing_restore_items(CopyDataSpec *specs,
 			targetSQL,
 			"with o(classid, objid) as ("
 			"  select 'pg_class'::regclass::oid, oid from pg_class "
-			"   where relkind in ('i', 'I') "
+			"   where relkind <> 't' "
+			"  union all "
+			"  select 'pg_inherits'::regclass::oid, oid from pg_class "
+			"   where relispartition "
+			"  union all "
+			"  select 'pg_type'::regclass::oid, oid from pg_type "
+			"  union all "
+			"  select 'pg_proc'::regclass::oid, oid from pg_proc "
+			"  union all "
+			"  select 'pg_collation'::regclass::oid, oid from pg_collation "
+			"  union all "
+			"  select 'pg_operator'::regclass::oid, oid from pg_operator "
+			"  union all "
+			"  select 'pg_ts_config'::regclass::oid, oid from pg_ts_config "
+			"  union all "
+			"  select 'pg_ts_dict'::regclass::oid, oid from pg_ts_dict "
 			"  union all "
 			"  select 'pg_constraint'::regclass::oid, oid from pg_constraint "
 			"  union all "
@@ -1045,7 +1103,11 @@ copydb_fetch_existing_restore_items(CopyDataSpec *specs,
 			targetSQL,
 			") "
 			"select o.classid, "
-			"       (pg_identify_object(o.classid, o.objid, 0)).identity "
+			"       case when o.classid = 'pg_inherits'::regclass "
+			"            then (pg_identify_object('pg_class'::regclass, "
+			"                                     o.objid, 0)).identity "
+			"            else (pg_identify_object(o.classid, o.objid, 0)).identity "
+			"        end "
 			"  from o "
 			" where o.objid >= 16384 "
 			"   and o.classid = any($1::oid[])");
@@ -1099,17 +1161,19 @@ copydb_fetch_existing_restore_items(CopyDataSpec *specs,
 			qsort(existing->keys, existing->count, sizeof(uint64_t),
 				  cmp_uint64);
 
-			log_info("Found %d post-data objects on the target database "
+			log_info("Found %d %s objects on the target database "
 					 "already, out of %d, skipping them (--resume)",
 					 existing->count,
+					 sectionName,
 					 oids.count);
 		}
 	}
 
 	if (!success)
 	{
-		log_error("Failed to find the post-data objects that exist on the "
-				  "target database already, see above for details");
+		log_error("Failed to find the %s objects that exist on the "
+				  "target database already, see above for details",
+				  sectionName);
 	}
 
 	copydb_free_identities(&source);
@@ -1128,7 +1192,8 @@ copydb_restore_item_exists(RestoreListExisting *existing,
 		return false;
 	}
 
-	uint64_t key = ((uint64_t) item->catalogOid << 32) | item->objectOid;
+	uint64_t key =
+		((uint64_t) copydb_restore_item_catalog(item) << 32) | item->objectOid;
 
 	return bsearch(&key, existing->keys, existing->count,
 				   sizeof(uint64_t), cmp_uint64) != NULL;
@@ -1222,9 +1287,19 @@ copydb_write_restore_list(CopyDataSpec *specs, PostgresDumpSection section)
 		return false;
 	}
 
-	if (section == PG_DUMP_SECTION_POST_DATA &&
+	/*
+	 * With --drop-if-exists the pre-data objects found on the target are
+	 * dropped before the restore, which then has to create them all.
+	 */
+	bool lookupExisting =
 		specs->resume &&
+		!(section == PG_DUMP_SECTION_PRE_DATA &&
+		  specs->restoreOptions.dropIfExists);
+
+	if (lookupExisting &&
 		!copydb_fetch_existing_restore_items(specs,
+											 section == PG_DUMP_SECTION_PRE_DATA
+											 ? "pre-data" : "post-data",
 											 listOutFilename,
 											 &(context.existing)))
 	{
