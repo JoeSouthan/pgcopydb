@@ -21,7 +21,7 @@
 #include "summary.h"
 
 
-static bool copydb_prepare_sequence_specs_hook(void *ctx, SourceSequence *seq);
+static bool copydb_collect_sequences_hook(void *ctx, SourceSequence *seq);
 static bool copydb_copy_all_sequences_hook(void *ctx, SourceSequence *seq);
 
 typedef struct PrepareSequenceContext
@@ -29,6 +29,16 @@ typedef struct PrepareSequenceContext
 	PGSQL *pgsql;
 	DatabaseCatalog *sourceDB;
 } PrepareSequenceContext;
+
+typedef struct CollectSequencesContext
+{
+	SourceSequence *array;
+	int64_t count;
+	int64_t capacity;
+} CollectSequencesContext;
+
+static bool copydb_prepare_sequence_spec(PrepareSequenceContext *context,
+										 SourceSequence *seq);
 
 
 /*
@@ -83,14 +93,45 @@ copydb_prepare_sequence_specs(CopyDataSpec *specs, PGSQL *pgsql, bool reset)
 		.sourceDB = sourceDB
 	};
 
-	if (!catalog_iter_s_seq(sourceDB,
-							&context,
-							&copydb_prepare_sequence_specs_hook))
+	/*
+	 * Collect the sequences first, and fetch and store their values once the
+	 * iteration is over: a catalog write from the iterator callback fails
+	 * with SQLITE_BUSY_SNAPSHOT once another process (the follow process, for
+	 * instance) has committed to the catalog since the iteration started.
+	 */
+	CollectSequencesContext collect = {
+		.array = (SourceSequence *) calloc(count.sequences + 1,
+										   sizeof(SourceSequence)),
+		.count = 0,
+		.capacity = count.sequences
+	};
+
+	if (collect.array == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	if (!catalog_iter_s_seq(sourceDB, &collect, &copydb_collect_sequences_hook))
 	{
 		log_error("Failed to prepare our internal sequence catalogs, "
 				  "see above for details");
+		free(collect.array);
 		return false;
 	}
+
+	for (int64_t i = 0; i < collect.count; i++)
+	{
+		if (!copydb_prepare_sequence_spec(&context, &(collect.array[i])))
+		{
+			log_error("Failed to prepare our internal sequence catalogs, "
+					  "see above for details");
+			free(collect.array);
+			return false;
+		}
+	}
+
+	free(collect.array);
 
 	if (reset)
 	{
@@ -130,12 +171,35 @@ copydb_prepare_sequence_specs(CopyDataSpec *specs, PGSQL *pgsql, bool reset)
 
 
 /*
- * copydb_prepare_sequence_specs_hook is an iterator callback function.
+ * copydb_collect_sequences_hook is an iterator callback function. It keeps a
+ * copy of each sequence of the catalog.
  */
 static bool
-copydb_prepare_sequence_specs_hook(void *ctx, SourceSequence *seq)
+copydb_collect_sequences_hook(void *ctx, SourceSequence *seq)
 {
-	PrepareSequenceContext *context = (PrepareSequenceContext *) ctx;
+	CollectSequencesContext *context = (CollectSequencesContext *) ctx;
+
+	if (context->count >= context->capacity)
+	{
+		log_error("BUG: more sequences than the %lld we counted",
+				  (long long) context->capacity);
+		return false;
+	}
+
+	context->array[(context->count)++] = *seq;
+
+	return true;
+}
+
+
+/*
+ * copydb_prepare_sequence_spec fetches the current values of the given
+ * sequence on the source database and stores them in our catalog.
+ */
+static bool
+copydb_prepare_sequence_spec(PrepareSequenceContext *context,
+							 SourceSequence *seq)
+{
 	PGSQL *pgsql = context->pgsql;
 
 	/*
