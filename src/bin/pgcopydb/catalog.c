@@ -30,6 +30,7 @@
 
 
 static bool catalog_upgrade_source_schema(DatabaseCatalog *catalog);
+static bool catalog_upgrade_summary_conoid(DatabaseCatalog *catalog);
 
 
 /*
@@ -1691,7 +1692,8 @@ catalog_init(DatabaseCatalog *catalog)
 	}
 
 	if (catalog->type == DATABASE_CATALOG_TYPE_SOURCE &&
-		!catalog_upgrade_source_schema(catalog))
+		(!catalog_upgrade_source_schema(catalog) ||
+		 !catalog_upgrade_summary_conoid(catalog)))
 	{
 		/* errors have already been logged */
 		sqlite3_close(catalog->db);
@@ -2372,6 +2374,126 @@ catalog_upgrade_source_schema(DatabaseCatalog *catalog)
 	for (int i = 0; success && lacksTables && i < count; i++)
 	{
 		success = catalog_execute(catalog, ddls[i]);
+	}
+
+	if (success)
+	{
+		success = catalog_commit(catalog);
+	}
+	else
+	{
+		(void) catalog_execute(catalog, "ROLLBACK");
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return success;
+}
+
+
+/*
+ * catalog_source_lacks_summary_conoid sets lacks when a source catalog
+ * predates the unique summary_conoid index. A catalog without a summary table
+ * is still being created, and lacks nothing.
+ */
+static bool
+catalog_source_lacks_summary_conoid(DatabaseCatalog *catalog, bool *lacks)
+{
+	char *sql =
+		"select exists(select 1 from sqlite_master "
+		"               where type = 'table' and name = 'summary') "
+		"   and not exists(select 1 from sqlite_master "
+		"                   where type = 'index' and name = 'summary_conoid')";
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(catalog->db, sql, &query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (catalog_sql_step(&query) != SQLITE_ROW)
+	{
+		log_error("Failed to check the summary indexes of \"%s\": %s",
+				  catalog->dbfile,
+				  sqlite3_errmsg(catalog->db));
+		(void) catalog_sql_finalize(&query);
+		return false;
+	}
+
+	*lacks = sqlite3_column_int(query.ppStmt, 0) == 1;
+
+	return catalog_sql_finalize(&query);
+}
+
+
+/*
+ * catalog_upgrade_summary_conoid adds the unique summary_conoid index, that
+ * summary_add_constraint relies on, to a source catalog written by an older
+ * pgcopydb. Such a catalog can have several summary rows for a constraint,
+ * left by a run that was interrupted while creating it: keep the one that is
+ * done, or else the latest one.
+ */
+static bool
+catalog_upgrade_summary_conoid(DatabaseCatalog *catalog)
+{
+	bool lacks = false;
+
+	/* the common case only reads the schema, and takes no lock */
+	if (!catalog_source_lacks_summary_conoid(catalog, &lacks))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!lacks)
+	{
+		return true;
+	}
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!catalog_begin(catalog, true))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	char *ddls[] = {
+		"delete from summary "
+		" where conoid is not null "
+		"   and rowid not in "
+		"       (select (select s2.rowid from summary s2 "
+		"                 where s2.conoid = s1.conoid "
+		"              order by s2.done_time_epoch is null, s2.rowid desc "
+		"                 limit 1) "
+		"          from summary s1 "
+		"         where s1.conoid is not null "
+		"      group by s1.conoid)",
+
+		"create unique index summary_conoid on summary(conoid) "
+		" where conoid is not null"
+	};
+
+	/* another process might have upgraded the catalog in the meantime */
+	bool success = catalog_source_lacks_summary_conoid(catalog, &lacks);
+
+	if (success && lacks)
+	{
+		log_notice("Adding index summary_conoid to \"%s\"", catalog->dbfile);
+
+		int count = sizeof(ddls) / sizeof(ddls[0]);
+
+		for (int i = 0; success && i < count; i++)
+		{
+			success = catalog_execute(catalog, ddls[i]);
+		}
 	}
 
 	if (success)
