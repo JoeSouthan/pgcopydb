@@ -298,8 +298,8 @@ copydb_copy_supervisor(CopyDataSpec *specs)
 	DatabaseCatalog *sourceDB = &(specs->catalogs.source);
 
 	/*
-	 * Before forking any workers, open the catalog briefly to clear two kinds
-	 * of stale state left by a previous run:
+	 * Before forking any workers, open the catalog briefly to clear three
+	 * kinds of stale state left by a previous run:
 	 *
 	 *  1. process table entries: written by workers that crashed without
 	 *     calling catalog_delete_process.  Stale entries make the progress
@@ -311,6 +311,9 @@ copydb_copy_supervisor(CopyDataSpec *specs)
 	 *     Inside a Docker container whose PID namespace was reset the same
 	 *     numeric PID is often recycled by an unrelated process, so kill()
 	 *     returns 0 and pgcopydb wrongly refuses to copy the table (#692).
+	 *
+	 *  3. split tables with only some parts done, and the parts-done
+	 *     election of the previous run, see summary_reset_split_tables.
 	 *
 	 * After cleanup, close the catalog again so that table-data workers
 	 * (forked next) open their own fresh connections (#881).
@@ -328,6 +331,12 @@ copydb_copy_supervisor(CopyDataSpec *specs)
 	}
 
 	if (!summary_delete_incomplete_table_copy(sourceDB))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!summary_reset_split_tables(sourceDB))
 	{
 		/* errors have already been logged */
 		return false;
@@ -611,23 +620,18 @@ copydb_copy_supervisor_add_table_hook(void *ctx, SourceTable *table)
 		 *
 		 * Before adding the table to be processed by workers, truncate it on
 		 * the target database now, avoiding concurrency issues.
+		 *
+		 * On --resume, workers skip the parts done on a previous run, so keep
+		 * a table when all of its parts are done, and queue only one part: it
+		 * elects the worker that queues the indexes, which a worker taking two
+		 * done parts would otherwise win twice. A table with only some parts
+		 * done has had them forgotten by summary_reset_split_tables, because a
+		 * part can commit its COPY before its done row is written: it is
+		 * truncated and copied again in full.
 		 */
-		bool granted = false;
+		bool allPartsDone = specs->runState.tableCopyIsDone;
 
-		if (!pgsql_has_table_privilege(dst, table->qname, "TRUNCATE", &granted))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-
-		/*
-		 * When resuming a previous run, some of the parts of this table might
-		 * already be done: their rows are committed in the target table. A
-		 * TRUNCATE now would discard them while the workers skip those parts,
-		 * so skip the TRUNCATE in that case. A part that was interrupted
-		 * while running is rolled back by Postgres, and is copied again.
-		 */
-		if (granted)
+		if (!allPartsDone)
 		{
 			CopyTableDataSpec tableSpecs = { .sourceTable = table };
 
@@ -638,16 +642,24 @@ copydb_copy_supervisor_add_table_hook(void *ctx, SourceTable *table)
 				return false;
 			}
 
-			if (tableSpecs.countPartsDone > 0)
-			{
-				log_notice("Skipping TRUNCATE of table %s: "
-						   "%u of %d parts are already done",
-						   table->qname,
-						   tableSpecs.countPartsDone,
-						   table->partition.partCount);
+			allPartsDone =
+				tableSpecs.countPartsDone == table->partition.partCount;
+		}
 
-				granted = false;
-			}
+		bool granted = false;
+
+		if (allPartsDone)
+		{
+			log_info("Skipping TRUNCATE of %s, all %d parts already done "
+					 "on a previous run",
+					 table->qname,
+					 table->partition.partCount);
+		}
+		else if (!pgsql_has_table_privilege(dst, table->qname, "TRUNCATE",
+											&granted))
+		{
+			/* errors have already been logged */
+			return false;
 		}
 
 		if (granted)
@@ -668,7 +680,9 @@ copydb_copy_supervisor_add_table_hook(void *ctx, SourceTable *table)
 			}
 		}
 
-		for (int i = 0; i < table->partition.partCount; i++)
+		int queuedParts = allPartsDone ? 1 : table->partition.partCount;
+
+		for (int i = 0; i < queuedParts; i++)
 		{
 			int partNumber = i + 1;
 
@@ -1382,31 +1396,6 @@ copydb_table_parts_are_all_done(CopyDataSpec *specs,
 		{
 			/* errors have already been logged */
 			return false;
-		}
-
-		/*
-		 * On --resume the row may still name the worker of the interrupted
-		 * run that first saw all the parts done. When that pid is neither
-		 * ours nor a live process, the indexes of the table might never have
-		 * been queued: reclaim the row so that this worker queues them. The
-		 * indexes that are done already are skipped by the index workers.
-		 */
-		int stalePid = tableSpecs->partsDonePid;
-
-		if (stalePid > 0 && stalePid != getpid() && kill(stalePid, 0) != 0)
-		{
-			log_notice("Found stale pid %d holding the indexes of table %s, "
-					   "reclaiming it",
-					   stalePid,
-					   tableSpecs->sourceTable->qname);
-
-			if (!summary_reclaim_table_parts_done(sourceDB, tableSpecs,
-												  stalePid) ||
-				!summary_lookup_table_parts_done(sourceDB, tableSpecs))
-			{
-				/* errors have already been logged */
-				return false;
-			}
 		}
 
 		/* set isBeingProcessed to false to allow processing indexes */

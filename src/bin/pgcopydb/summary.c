@@ -409,6 +409,124 @@ summary_delete_incomplete_table_copy(DatabaseCatalog *catalog)
 
 
 /*
+ * summary_execute_statements runs each statement of the list, under the
+ * catalog semaphore.
+ */
+static bool
+summary_execute_statements(DatabaseCatalog *catalog,
+						   const char *caller,
+						   char **sqls,
+						   int count)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: %s: db is NULL", caller);
+		return false;
+	}
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	for (int i = 0; i < count; i++)
+	{
+		SQLiteQuery query = { 0 };
+
+		if (!catalog_sql_prepare(db, sqls[i], &query) ||
+			!catalog_sql_execute_once(&query))
+		{
+			/* errors have already been logged */
+			(void) semaphore_unlock(&(catalog->sema));
+			return false;
+		}
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * summary_reset_split_tables forgets the parts of a split table that has only
+ * some parts done, so that all of them are copied again after its TRUNCATE,
+ * and clears s_table_parts_done, whose pids belong to a previous run.
+ */
+bool
+summary_reset_split_tables(DatabaseCatalog *catalog)
+{
+	char *sqls[] = {
+		/* a part can commit its COPY and die before its done row is written */
+		"delete from summary "
+		" where tableoid in "
+		"       (select p.oid "
+		"          from s_table_part p "
+		"               left join summary s "
+		"                      on s.tableoid = p.oid "
+		"                     and s.partnum = p.partnum "
+		"                     and s.pid > 0 and s.done_time_epoch > 0 "
+		"      group by p.oid "
+		"        having count(s.tableoid) between 1 and count(*) - 1)",
+
+		"delete from s_table_parts_done"
+	};
+
+	return summary_execute_statements(catalog,
+									  "summary_reset_split_tables",
+									  sqls,
+									  sizeof(sqls) / sizeof(sqls[0]));
+}
+
+
+/*
+ * summary_delete_incomplete_index_build removes the index rows a previous run
+ * left without a done time, for the reason given at
+ * summary_delete_incomplete_table_copy: their pid may be reused (#692).
+ */
+bool
+summary_delete_incomplete_index_build(DatabaseCatalog *catalog)
+{
+	char *sqls[] = {
+		"delete from summary "
+		" where indexoid is not null "
+		"   and done_time_epoch is null"
+	};
+
+	return summary_execute_statements(catalog,
+									  "summary_delete_incomplete_index_build",
+									  sqls,
+									  sizeof(sqls) / sizeof(sqls[0]));
+}
+
+
+/*
+ * summary_delete_all_table_indexes_done forgets the previous run's constraint
+ * builder of each table, and the constraints it left unfinished, so that a
+ * resumed run elects one again; done constraints are skipped by done time.
+ */
+bool
+summary_delete_all_table_indexes_done(DatabaseCatalog *catalog)
+{
+	char *sqls[] = {
+		"delete from s_table_indexes_done",
+
+		"delete from summary "
+		" where conoid is not null "
+		"   and done_time_epoch is null"
+	};
+
+	return summary_execute_statements(catalog,
+									  "summary_delete_all_table_indexes_done",
+									  sqls,
+									  sizeof(sqls) / sizeof(sqls[0]));
+}
+
+
+/*
  * summary_add_table INSERTs a SourceTable summary entry to our internal
  * catalogs database.
  */
@@ -820,74 +938,6 @@ summary_add_table_parts_done(DatabaseCatalog *catalog,
 	}
 
 	/* now execute the query, which return exactly one row */
-	if (!catalog_sql_execute_once(&query))
-	{
-		/* errors have already been logged */
-		(void) semaphore_unlock(&(catalog->sema));
-		return false;
-	}
-
-	(void) semaphore_unlock(&(catalog->sema));
-
-	return true;
-}
-
-
-/*
- * summary_reclaim_table_parts_done hands the s_table_parts_done row of a
- * table over to the current process when it still holds the given pid, the
- * one of a worker that died. Only one of the workers that race for it gets
- * it: the others no longer match the stale pid.
- */
-bool
-summary_reclaim_table_parts_done(DatabaseCatalog *catalog,
-								 CopyTableDataSpec *tableSpecs,
-								 int stalePid)
-{
-	sqlite3 *db = catalog->db;
-
-	if (db == NULL)
-	{
-		log_error("BUG: summary_reclaim_table_parts_done: db is NULL");
-		return false;
-	}
-
-	SourceTable *table = tableSpecs->sourceTable;
-
-	char *sql =
-		"update s_table_parts_done set pid = $1 "
-		" where tableoid = $2 and pid = $3";
-
-	if (!semaphore_lock(&(catalog->sema)))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	SQLiteQuery query = { 0 };
-
-	if (!catalog_sql_prepare(db, sql, &query))
-	{
-		/* errors have already been logged */
-		(void) semaphore_unlock(&(catalog->sema));
-		return false;
-	}
-
-	BindParam params[] = {
-		{ BIND_PARAMETER_TYPE_INT64, "pid", getpid(), NULL },
-		{ BIND_PARAMETER_TYPE_INT64, "tableoid", table->oid, NULL },
-		{ BIND_PARAMETER_TYPE_INT64, "stalepid", stalePid, NULL }
-	};
-
-	int count = sizeof(params) / sizeof(params[0]);
-
-	if (!catalog_sql_bind(&query, params, count))
-	{
-		/* errors have already been logged */
-		(void) semaphore_unlock(&(catalog->sema));
-		return false;
-	}
-
 	if (!catalog_sql_execute_once(&query))
 	{
 		/* errors have already been logged */
@@ -2569,13 +2619,14 @@ summary_table_fetch_count_indexes_left(SQLiteQuery *query)
 
 
 /*
- * summary_add_table_indexes_done registers the first pid that sees all tables
- * indexes are done, using SQLite insert-or-ignore returning facility to ensure
- * concurrency control.
+ * summary_add_table_indexes_done registers the first pid that sees all table
+ * indexes done; only the call whose insert-or-ignore adds the row is elected,
+ * so a worker that sees it again for another index of the table is not.
  */
 bool
 summary_add_table_indexes_done(DatabaseCatalog *catalog,
-							   CopyTableDataSpec *tableSpecs)
+							   CopyTableDataSpec *tableSpecs,
+							   bool *elected)
 {
 	sqlite3 *db = catalog->db;
 
@@ -2621,70 +2672,6 @@ summary_add_table_indexes_done(DatabaseCatalog *catalog,
 		return false;
 	}
 
-	/* now execute the query, which return exactly one row */
-	if (!catalog_sql_execute_once(&query))
-	{
-		/* errors have already been logged */
-		(void) semaphore_unlock(&(catalog->sema));
-		return false;
-	}
-
-	(void) semaphore_unlock(&(catalog->sema));
-
-	return true;
-}
-
-
-/*
- * summary_delete_table_indexes_done removes the s_table_indexes_done row for a
- * table, so a resuming worker can reclaim the right to build its constraints
- * after the process that first saw the indexes done has died mid-constraint.
- */
-bool
-summary_delete_table_indexes_done(DatabaseCatalog *catalog,
-								  CopyTableDataSpec *tableSpecs)
-{
-	sqlite3 *db = catalog->db;
-
-	if (db == NULL)
-	{
-		log_error("BUG: summary_delete_table_indexes_done: db is NULL");
-		return false;
-	}
-
-	SourceTable *table = tableSpecs->sourceTable;
-
-	char *sql = "delete from s_table_indexes_done where tableoid = $1";
-
-	if (!semaphore_lock(&(catalog->sema)))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	SQLiteQuery query = { 0 };
-
-	if (!catalog_sql_prepare(db, sql, &query))
-	{
-		/* errors have already been logged */
-		(void) semaphore_unlock(&(catalog->sema));
-		return false;
-	}
-
-	/* bind our parameters now */
-	BindParam params[] = {
-		{ BIND_PARAMETER_TYPE_INT64, "tableoid", table->oid, NULL }
-	};
-
-	int count = sizeof(params) / sizeof(params[0]);
-
-	if (!catalog_sql_bind(&query, params, count))
-	{
-		/* errors have already been logged */
-		(void) semaphore_unlock(&(catalog->sema));
-		return false;
-	}
-
 	/* now execute the query, which does not return any row */
 	if (!catalog_sql_execute_once(&query))
 	{
@@ -2692,6 +2679,8 @@ summary_delete_table_indexes_done(DatabaseCatalog *catalog,
 		(void) semaphore_unlock(&(catalog->sema));
 		return false;
 	}
+
+	*elected = sqlite3_changes(db) == 1;
 
 	(void) semaphore_unlock(&(catalog->sema));
 

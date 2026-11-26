@@ -100,12 +100,17 @@ copydb_index_supervisor(CopyDataSpec *specs)
 	}
 
 	/*
-	 * Remove stale process table entries from any previous run before workers
-	 * start.  Entries left by crashed workers or by a prior container whose
-	 * PID namespace was reset would cause resume logic to misidentify live
-	 * PIDs (issue #692) and could block retried index creation (issue #881).
+	 * Remove stale process table entries, the summary rows of unfinished index
+	 * builds, and the constraint builder elections from any previous run
+	 * before workers start.  Entries left by crashed workers or by a prior
+	 * container whose PID namespace was reset would cause resume logic to
+	 * misidentify live PIDs (issue #692) and could block retried index
+	 * creation (issue #881), and an election won by a dead worker would leave
+	 * the table's constraints unbuilt.
 	 */
-	if (!catalog_delete_all_process_entries(sourceDB))
+	if (!catalog_delete_all_process_entries(sourceDB) ||
+		!summary_delete_incomplete_index_build(sourceDB) ||
+		!summary_delete_all_table_indexes_done(sourceDB))
 	{
 		/* errors have already been logged */
 		return false;
@@ -643,59 +648,23 @@ copydb_table_indexes_are_done(CopyDataSpec *specs,
 	{
 		*indexesAreDone = true;
 
-		/* insert or ignore our pid as the partsDonePid */
-		if (!summary_add_table_indexes_done(sourceDB, &tableSpecs))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-
-		if (!summary_lookup_table_indexes_done(sourceDB, &tableSpecs))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-
 		/*
-		 * On --resume the row may still name the worker from the interrupted run
-		 * that first saw the indexes done. If that pid is neither ours nor a live
-		 * process, the constraints it was meant to build were never finished:
-		 * reclaim the row for this worker so constraint creation runs again,
-		 * mirroring the stale-pid handling in copydb_index_is_being_processed.
+		 * Only the call whose insert adds the row is elected: comparing pids
+		 * would elect a worker again for its next done index of the table.
 		 */
-		if (tableSpecs.indexesDonePid != 0 &&
-			tableSpecs.indexesDonePid != getpid() &&
-			kill(tableSpecs.indexesDonePid, 0) != 0)
+		bool elected = false;
+
+		if (!summary_add_table_indexes_done(sourceDB, &tableSpecs, &elected))
 		{
-			log_notice("Found stale pid %d holding the constraint build for "
-					   "table %s, reclaiming it",
-					   tableSpecs.indexesDonePid,
-					   table->qname);
-
-			if (!summary_delete_table_indexes_done(sourceDB, &tableSpecs))
-			{
-				/* errors have already been logged */
-				return false;
-			}
-
-			if (!summary_add_table_indexes_done(sourceDB, &tableSpecs))
-			{
-				/* errors have already been logged */
-				return false;
-			}
-
-			if (!summary_lookup_table_indexes_done(sourceDB, &tableSpecs))
-			{
-				/* errors have already been logged */
-				return false;
-			}
+			/* errors have already been logged */
+			return false;
 		}
 
 		/*
 		 * Set constraintsAreBeingBuilt to false to allow the current worker to
 		 * process constraints.
 		 */
-		*constraintsAreBeingBuilt = (tableSpecs.indexesDonePid != getpid());
+		*constraintsAreBeingBuilt = !elected;
 	}
 
 	return true;
