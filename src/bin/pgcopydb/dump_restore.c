@@ -760,8 +760,12 @@ copydb_write_restore_list(CopyDataSpec *specs, PostgresDumpSection section)
 		return false;
 	}
 
-	/* edit our post.list file now */
-	FILE *out = fopen_with_umask(listFilename, "ab", FOPEN_FLAGS_A, 0644);
+	/*
+	 * Write the list from scratch: a previous run that failed left its own
+	 * list behind, and pg_restore only reads the first entry for a given
+	 * dumpId, ignoring the ones we would append now.
+	 */
+	FILE *out = fopen_with_umask(listFilename, "wb", FOPEN_FLAGS_W, 0644);
 
 	if (out == NULL)
 	{
@@ -820,7 +824,7 @@ copydb_write_schemas_restore_list(CopyDataSpec *specs)
 		return false;
 	}
 
-	FILE *out = fopen_with_umask(listFilename, "ab", FOPEN_FLAGS_A, 0644);
+	FILE *out = fopen_with_umask(listFilename, "wb", FOPEN_FLAGS_W, 0644);
 
 	if (out == NULL)
 	{
