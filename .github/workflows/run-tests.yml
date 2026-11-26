@@ -126,6 +126,7 @@ jobs:
           - three-databases
           - split-table-resume
           - orphaned-target-backend
+          - orphaned-target-ddl
           - cdc-low-level
           - cdc-test-decoding
           - cdc-endpos-mid-txn

@@ -513,6 +513,19 @@ static GUC targetKeepaliveSettings[] = {
 	{ NULL, NULL }
 };
 
+/*
+ * A target backend running a statement does not read from its client, so the
+ * keepalives above do not end it: a CREATE INDEX or ALTER TABLE ADD CONSTRAINT
+ * whose client died runs to completion and commits work that the catalogs
+ * never record as done. Since Postgres 14 the server can check the client
+ * socket while it runs a statement, and cancel the statement once the client
+ * is gone.
+ */
+static GUC targetClientCheckSettings[] = {
+	{ "client_connection_check_interval", "'10s'" },
+	{ NULL, NULL }
+};
+
 
 /*
  * pgsql_open_connection opens a PostgreSQL connection, given a PGSQL client
@@ -647,12 +660,16 @@ pgsql_open_connection(PGSQL *pgsql)
 
 		pgsql->connectionStatementType = PGSQL_CONNECTION_MULTI_STATEMENT;
 		bool keepalivesSet = pgsql_set_gucs(pgsql, targetKeepaliveSettings);
+		bool clientCheckSet =
+			keepalivesSet &&
+			(PQserverVersion(pgsql->connection) < 140000 ||
+			 pgsql_set_gucs(pgsql, targetClientCheckSettings));
 		pgsql->connectionStatementType = statementType;
 
-		if (!keepalivesSet)
+		if (!keepalivesSet || !clientCheckSet)
 		{
-			log_error("Failed to set TCP keepalives on the target connection, "
-					  "see above for details");
+			log_error("Failed to set TCP keepalives or the client connection "
+					  "check on the target connection, see above for details");
 			pgsql_finish(pgsql);
 			return NULL;
 		}

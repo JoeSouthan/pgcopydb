@@ -458,7 +458,8 @@ The following options are available to ``pgcopydb clone``:
   When a session waits on its client, for example in ``COPY FROM STDIN`` or idle in a transaction, and the client stays unreachable for about 70 seconds, the target ends the session and releases its locks.
   That covers a pgcopydb process that died without its connection close reaching the target, which the target would otherwise notice only after about two hours at the kernel defaults.
   It also ends a live session whose client is unreachable for that long, such as across a network partition.
-  A session busy in a long statement, such as ``CREATE INDEX``, keeps its locks until that statement ends.
+  On Postgres 14 and later, pgcopydb also sets ``client_connection_check_interval`` to 10 seconds on these sessions, so that the target cancels a statement such as ``CREATE INDEX`` or ``ALTER TABLE ... ADD CONSTRAINT`` within about 10 seconds of its client closing the connection, instead of running it to completion and committing work that pgcopydb never recorded as done.
+  On older servers, or when the connection close never reaches the target, a session busy in a long statement keeps its locks until that statement ends.
   Behind a connection pooler, these settings apply only to the connection between the pooler and the target.
 
 --dir
