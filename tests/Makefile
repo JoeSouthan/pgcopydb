@@ -6,11 +6,11 @@ export PGVERSION
 BUILD_ARGS = --build-arg PGVERSION=$(PGVERSION)
 
 all: pagila pagila-multi-steps blobs unit filtering extensions \
-	 partitioned-target all-databases \
+	 partitioned-target all-databases target-resume-recovery \
 	 cdc-wal2json cdc-test-decoding cdc-endpos-mid-txn cdc-low-level \
 	 cdc-replica-identity-index cdc-partitioned-target cdc-matview \
 	 cdc-endpos-in-multi-wal-txn cdc-file-rotation cdc-file-rotation-live cdc-concurrent-backlog cdc-copy-multi-insert cdc-origin-abort defer-validate-fks \
-	 follow-defer-validate-fks \
+	 follow-defer-validate-fks resume-after-failure \
 	 cdc-pgoutput cdc-filtering-pgoutput \
 	 follow-wal2json follow-9.6 follow-data-only \
 	 follow-pgoutput follow-filtering \
@@ -43,6 +43,9 @@ filtering: build
 	$(MAKE) -C $@
 
 partitioned-target: build
+	$(MAKE) -C $@
+
+target-resume-recovery: build
 	$(MAKE) -C $@
 
 extensions: build
@@ -100,6 +103,9 @@ defer-validate-fks: build
 	$(MAKE) -C $@
 
 follow-defer-validate-fks: build
+	$(MAKE) -C $@
+
+resume-after-failure: build
 	$(MAKE) -C $@
 
 cdc-pgoutput: build
@@ -173,12 +179,12 @@ clean-images:
 	-docker rmi pagila multi 2>/dev/null; true
 
 .PHONY: all build build-pagila build-multi force-build clean-images
-.PHONY: pagila pagila-multi-steps blobs unit filtering partitioned-target extensions
+.PHONY: pagila pagila-multi-steps blobs unit filtering partitioned-target extensions target-resume-recovery
 .PHONY: toc-coverage
 .PHONY: all-databases three-databases
 .PHONY: cdc-wal2json cdc-test-decoding cdc-endpos-mid-txn cdc-low-level cdc-replica-identity-index cdc-partitioned-target
 .PHONY: cdc-endpos-in-multi-wal-txn cdc-file-rotation cdc-file-rotation-live cdc-concurrent-backlog cdc-copy-multi-insert cdc-origin-abort
-.PHONY: defer-validate-fks follow-defer-validate-fks
+.PHONY: defer-validate-fks follow-defer-validate-fks resume-after-failure
 .PHONY: cdc-pgoutput cdc-filtering-pgoutput follow-pgoutput follow-filtering
 .PHONY: follow-wal2json follow-9.6
 .PHONY: follow-endpos-tail follow-endpos-quiet-tail follow-ddl-message-stall

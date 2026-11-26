@@ -251,6 +251,19 @@ copydb_target_prepare_schema(CopyDataSpec *specs)
 			/* errors have already been logged */
 			return false;
 		}
+
+		/*
+		 * The target catalog was cached before the DROP ... CASCADE above and
+		 * still lists the constraints that drop just removed. Re-query the live
+		 * target so the foundConstraintOnTarget guard does not skip rebuilding
+		 * them, which would silently leave the tables without their primary-key
+		 * and unique constraints.
+		 */
+		if (!copydb_prepare_target_catalog(specs))
+		{
+			/* errors have already been logged */
+			return false;
+		}
 	}
 
 	specs->restoreOptions.section = PG_RESTORE_SECTION_PRE_DATA;
@@ -645,12 +658,23 @@ copydb_target_finalize_schema(CopyDataSpec *specs)
 }
 
 
+/*
+ * The post-data entries of the archive that exist on the target already,
+ * found on --resume, by catalogOid << 32 | objectOid, sorted.
+ */
+typedef struct RestoreListExisting
+{
+	int count;
+	uint64_t *keys;             /* malloc'ed area */
+} RestoreListExisting;
+
 typedef struct RestoreListContext
 {
 	CopyDataSpec *specs;
 	FILE *outStream;
 	bool schemasOnly;   /* write only SCHEMA entries (first pass) */
 	PgcopydbReservedOids reservedOids;
+	RestoreListExisting existing;
 } RestoreListContext;
 
 
@@ -681,6 +705,414 @@ copydb_fetch_reserved_oids(CopyDataSpec *specs, PgcopydbReservedOids *oids)
 	(void) pgsql_finish(&src);
 
 	return true;
+}
+
+
+/*
+ * A post-data restore is not safe to run twice: CREATE INDEX, CREATE TRIGGER,
+ * ALTER TABLE ADD CONSTRAINT and the like fail when the object exists, and
+ * pg_restore then exits with an error. A run that failed during, or after,
+ * the post-data restore leaves those objects on the target, and its --resume
+ * would fail on each of them, every time.
+ *
+ * On --resume we look the objects of these entries up on the target, by the
+ * identity of the source object (pg_identify_object), and leave out of the
+ * restore list the ones that exist already. The other post-data entries
+ * (ACL, COMMENT, INDEX ATTACH, ROW SECURITY, REFRESH MATERIALIZED VIEW) can
+ * run again.
+ */
+static bool
+copydb_restore_item_may_exist(ArchiveContentItem *item)
+{
+	if (item->catalogOid == 0 || item->objectOid == 0)
+	{
+		return false;
+	}
+
+	switch (item->desc)
+	{
+		case ARCHIVE_TAG_INDEX:
+		case ARCHIVE_TAG_CONSTRAINT:
+		case ARCHIVE_TAG_FK_CONSTRAINT:
+		case ARCHIVE_TAG_CHECK_CONSTRAINT:
+		case ARCHIVE_TAG_TRIGGER:
+		case ARCHIVE_TAG_EVENT_TRIGGER:
+		case ARCHIVE_TAG_RULE:
+		case ARCHIVE_TAG_POLICY:
+		case ARCHIVE_TAG_STATISTICS:
+		case ARCHIVE_TAG_PUBLICATION:
+		case ARCHIVE_TAG_PUBLICATION_TABLE:
+		{
+			return true;
+		}
+
+		default:
+		{
+			return false;
+		}
+	}
+}
+
+
+typedef struct RestoreItemOids
+{
+	int count;
+	PQExpBuffer catalogOids;    /* {oid,oid,...} */
+	PQExpBuffer objectOids;     /* {oid,oid,...} */
+} RestoreItemOids;
+
+
+static bool
+copydb_collect_restore_item_oids_hook(void *ctx, ArchiveContentItem *item)
+{
+	RestoreItemOids *oids = (RestoreItemOids *) ctx;
+
+	if (copydb_restore_item_may_exist(item))
+	{
+		appendPQExpBuffer(oids->catalogOids, "%s%u",
+						  oids->count == 0 ? "" : ",", item->catalogOid);
+		appendPQExpBuffer(oids->objectOids, "%s%u",
+						  oids->count == 0 ? "" : ",", item->objectOid);
+		++(oids->count);
+	}
+
+	return true;
+}
+
+
+/* "catalogOid identity" strings, as found on the source or the target */
+typedef struct IdentityArray
+{
+	bool parsedOk;
+	int count;
+	char **identities;          /* malloc'ed area */
+	uint32_t *catalogOids;      /* malloc'ed area */
+	uint32_t *objectOids;       /* source only: the object of each identity */
+} IdentityArray;
+
+
+static void
+copydb_parse_identities(void *ctx, PGresult *result)
+{
+	IdentityArray *array = (IdentityArray *) ctx;
+	int nTuples = PQntuples(result);
+	bool withObjectOid = PQnfields(result) == 3;
+
+	array->parsedOk = false;
+	array->count = 0;
+	array->identities = (char **) calloc(nTuples + 1, sizeof(char *));
+	array->catalogOids = (uint32_t *) calloc(nTuples + 1, sizeof(uint32_t));
+	array->objectOids = (uint32_t *) calloc(nTuples + 1, sizeof(uint32_t));
+
+	if (array->identities == NULL ||
+		array->catalogOids == NULL ||
+		array->objectOids == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return;
+	}
+
+	for (int row = 0; row < nTuples; row++)
+	{
+		int idCol = withObjectOid ? 2 : 1;
+
+		/* the source object might have been dropped since the dump */
+		if (PQgetisnull(result, row, idCol))
+		{
+			continue;
+		}
+
+		PQExpBuffer buf = createPQExpBuffer();
+
+		appendPQExpBuffer(buf, "%s %s",
+						  PQgetvalue(result, row, 0),
+						  PQgetvalue(result, row, idCol));
+
+		if (PQExpBufferBroken(buf))
+		{
+			log_error(ALLOCATION_FAILED_ERROR);
+			destroyPQExpBuffer(buf);
+			return;
+		}
+
+		array->identities[array->count] = strdup(buf->data);
+		destroyPQExpBuffer(buf);
+
+		if (array->identities[array->count] == NULL)
+		{
+			log_error(ALLOCATION_FAILED_ERROR);
+			return;
+		}
+
+		if (!stringToUInt32(PQgetvalue(result, row, 0),
+							&(array->catalogOids[array->count])) ||
+			(withObjectOid &&
+			 !stringToUInt32(PQgetvalue(result, row, 1),
+							 &(array->objectOids[array->count]))))
+		{
+			log_error("Failed to parse the oids of \"%s\"",
+					  array->identities[array->count]);
+			free(array->identities[array->count]);
+			return;
+		}
+
+		++(array->count);
+	}
+
+	array->parsedOk = true;
+}
+
+
+static void
+copydb_free_identities(IdentityArray *array)
+{
+	for (int i = 0; i < array->count; i++)
+	{
+		free(array->identities[i]);
+	}
+
+	free(array->identities);
+	free(array->catalogOids);
+	free(array->objectOids);
+}
+
+
+static int
+cmp_identity(const void *a, const void *b)
+{
+	return strcmp(*(char *const *) a, *(char *const *) b);
+}
+
+
+static int
+cmp_uint64(const void *a, const void *b)
+{
+	uint64_t x = *(const uint64_t *) a;
+	uint64_t y = *(const uint64_t *) b;
+
+	return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+
+/*
+ * copydb_fetch_existing_restore_items fills-in existing with the entries of
+ * the given restore list whose object exists on the target already.
+ */
+static bool
+copydb_fetch_existing_restore_items(CopyDataSpec *specs,
+									const char *listOutFilename,
+									RestoreListExisting *existing)
+{
+	RestoreItemOids oids = {
+		.count = 0,
+		.catalogOids = createPQExpBuffer(),
+		.objectOids = createPQExpBuffer()
+	};
+
+	appendPQExpBufferStr(oids.catalogOids, "{");
+	appendPQExpBufferStr(oids.objectOids, "{");
+
+	if (!archive_iter_toc(listOutFilename,
+						  &oids,
+						  copydb_collect_restore_item_oids_hook))
+	{
+		log_error("Failed to parse the pg_restore list file \"%s\"",
+				  listOutFilename);
+		destroyPQExpBuffer(oids.catalogOids);
+		destroyPQExpBuffer(oids.objectOids);
+		return false;
+	}
+
+	appendPQExpBufferStr(oids.catalogOids, "}");
+	appendPQExpBufferStr(oids.objectOids, "}");
+
+	if (PQExpBufferBroken(oids.catalogOids) ||
+		PQExpBufferBroken(oids.objectOids))
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		destroyPQExpBuffer(oids.catalogOids);
+		destroyPQExpBuffer(oids.objectOids);
+		return false;
+	}
+
+	if (oids.count == 0)
+	{
+		destroyPQExpBuffer(oids.catalogOids);
+		destroyPQExpBuffer(oids.objectOids);
+		return true;
+	}
+
+	/* the identities of the source objects */
+	IdentityArray source = { 0 };
+	PGSQL src = { 0 };
+
+	char *sourceSQL =
+		"select t.classid, t.objid, "
+		"       (pg_identify_object(t.classid, t.objid, 0)).identity "
+		"  from unnest($1::oid[], $2::oid[]) as t(classid, objid)";
+
+	Oid sourceTypes[2] = { TEXTOID, TEXTOID };
+	const char *sourceValues[2] = {
+		oids.catalogOids->data, oids.objectOids->data
+	};
+
+	bool success =
+		pgsql_init(&src, specs->connStrings.source_pguri, PGSQL_CONN_SOURCE) &&
+		pgsql_execute_with_params(&src, sourceSQL, 2,
+								  sourceTypes, sourceValues,
+								  &source, &copydb_parse_identities) &&
+		source.parsedOk;
+
+	(void) pgsql_finish(&src);
+
+	/*
+	 * The identities of the same kinds of objects on the target, leaving out
+	 * the system objects, and the catalogs that the target does not have.
+	 */
+	IdentityArray target = { 0 };
+	PGSQL dst = { 0 };
+	PQExpBuffer targetSQL = createPQExpBuffer();
+
+	if (success)
+	{
+		success =
+			pgsql_init(&dst, specs->connStrings.target_pguri,
+					   PGSQL_CONN_TARGET) &&
+			pgsql_server_version(&dst);
+	}
+
+	if (success)
+	{
+		appendPQExpBufferStr(
+			targetSQL,
+			"with o(classid, objid) as ("
+			"  select 'pg_class'::regclass::oid, oid from pg_class "
+			"   where relkind in ('i', 'I') "
+			"  union all "
+			"  select 'pg_constraint'::regclass::oid, oid from pg_constraint "
+			"  union all "
+			"  select 'pg_trigger'::regclass::oid, oid from pg_trigger "
+			"   where not tgisinternal "
+			"  union all "
+			"  select 'pg_event_trigger'::regclass::oid, oid "
+			"    from pg_event_trigger "
+			"  union all "
+			"  select 'pg_rewrite'::regclass::oid, oid from pg_rewrite ");
+
+		if (dst.pgversion_num >= 90500)
+		{
+			appendPQExpBufferStr(
+				targetSQL,
+				"  union all "
+				"  select 'pg_policy'::regclass::oid, oid from pg_policy ");
+		}
+
+		if (dst.pgversion_num >= 100000)
+		{
+			appendPQExpBufferStr(
+				targetSQL,
+				"  union all "
+				"  select 'pg_statistic_ext'::regclass::oid, oid "
+				"    from pg_statistic_ext "
+				"  union all "
+				"  select 'pg_publication'::regclass::oid, oid "
+				"    from pg_publication "
+				"  union all "
+				"  select 'pg_publication_rel'::regclass::oid, oid "
+				"    from pg_publication_rel ");
+		}
+
+		appendPQExpBufferStr(
+			targetSQL,
+			") "
+			"select o.classid, "
+			"       (pg_identify_object(o.classid, o.objid, 0)).identity "
+			"  from o "
+			" where o.objid >= 16384 "
+			"   and o.classid = any($1::oid[])");
+
+		Oid targetTypes[1] = { TEXTOID };
+		const char *targetValues[1] = { oids.catalogOids->data };
+
+		success =
+			!PQExpBufferBroken(targetSQL) &&
+			pgsql_execute_with_params(&dst, targetSQL->data, 1,
+									  targetTypes, targetValues,
+									  &target, &copydb_parse_identities) &&
+			target.parsedOk;
+	}
+
+	(void) pgsql_finish(&dst);
+	destroyPQExpBuffer(targetSQL);
+	destroyPQExpBuffer(oids.catalogOids);
+	destroyPQExpBuffer(oids.objectOids);
+
+	if (success)
+	{
+		qsort(target.identities, target.count, sizeof(char *), cmp_identity);
+
+		existing->count = 0;
+		existing->keys = (uint64_t *) calloc(source.count + 1, sizeof(uint64_t));
+
+		if (existing->keys == NULL)
+		{
+			log_error(ALLOCATION_FAILED_ERROR);
+			success = false;
+		}
+
+		for (int i = 0; success && i < source.count; i++)
+		{
+			char *identity = source.identities[i];
+
+			if (bsearch(&identity, target.identities, target.count,
+						sizeof(char *), cmp_identity) == NULL)
+			{
+				continue;
+			}
+
+			existing->keys[(existing->count)++] =
+				((uint64_t) source.catalogOids[i] << 32) |
+				source.objectOids[i];
+		}
+
+		if (success)
+		{
+			qsort(existing->keys, existing->count, sizeof(uint64_t),
+				  cmp_uint64);
+
+			log_info("Found %d post-data objects on the target database "
+					 "already, out of %d, skipping them (--resume)",
+					 existing->count,
+					 oids.count);
+		}
+	}
+
+	if (!success)
+	{
+		log_error("Failed to find the post-data objects that exist on the "
+				  "target database already, see above for details");
+	}
+
+	copydb_free_identities(&source);
+	copydb_free_identities(&target);
+
+	return success;
+}
+
+
+static bool
+copydb_restore_item_exists(RestoreListExisting *existing,
+						   ArchiveContentItem *item)
+{
+	if (existing->count == 0)
+	{
+		return false;
+	}
+
+	uint64_t key = ((uint64_t) item->catalogOid << 32) | item->objectOid;
+
+	return bsearch(&key, existing->keys, existing->count,
+				   sizeof(uint64_t), cmp_uint64) != NULL;
 }
 
 
@@ -747,8 +1179,12 @@ copydb_write_restore_list(CopyDataSpec *specs, PostgresDumpSection section)
 		return false;
 	}
 
-	/* edit our post.list file now */
-	FILE *out = fopen_with_umask(listFilename, "ab", FOPEN_FLAGS_A, 0644);
+	/*
+	 * Write the list from scratch: a previous run that failed left its own
+	 * list behind, and pg_restore only reads the first entry for a given
+	 * dumpId, ignoring the ones we would append now.
+	 */
+	FILE *out = fopen_with_umask(listFilename, "wb", FOPEN_FLAGS_W, 0644);
 
 	if (out == NULL)
 	{
@@ -767,14 +1203,27 @@ copydb_write_restore_list(CopyDataSpec *specs, PostgresDumpSection section)
 		return false;
 	}
 
+	if (section == PG_DUMP_SECTION_POST_DATA &&
+		specs->resume &&
+		!copydb_fetch_existing_restore_items(specs,
+											 listOutFilename,
+											 &(context.existing)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
 	if (!archive_iter_toc(listOutFilename,
 						  &context,
 						  copydb_write_restore_list_hook))
 	{
 		log_error("Failed to prepare the pg_restore list file, "
 				  "see above for details");
+		free(context.existing.keys);
 		return false;
 	}
+
+	free(context.existing.keys);
 
 	if (fclose(out) == EOF)
 	{
@@ -807,7 +1256,7 @@ copydb_write_schemas_restore_list(CopyDataSpec *specs)
 		return false;
 	}
 
-	FILE *out = fopen_with_umask(listFilename, "ab", FOPEN_FLAGS_A, 0644);
+	FILE *out = fopen_with_umask(listFilename, "wb", FOPEN_FLAGS_W, 0644);
 
 	if (out == NULL)
 	{
@@ -1135,6 +1584,15 @@ copydb_write_restore_list_hook(void *ctx, ArchiveContentItem *item)
 				  item->catalogOid,
 				  item->objectOid,
 				  item->restoreListName);
+	}
+
+	if (!skip && copydb_restore_item_exists(&(context->existing), item))
+	{
+		skip = true;
+
+		log_notice("Skipping %s %s, it exists on the target database already",
+				   item->description,
+				   name != NULL ? name : "");
 	}
 
 	PQExpBuffer buf = createPQExpBuffer();

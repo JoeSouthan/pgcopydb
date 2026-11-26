@@ -620,6 +620,36 @@ copydb_copy_supervisor_add_table_hook(void *ctx, SourceTable *table)
 			return false;
 		}
 
+		/*
+		 * When resuming a previous run, some of the parts of this table might
+		 * already be done: their rows are committed in the target table. A
+		 * TRUNCATE now would discard them while the workers skip those parts,
+		 * so skip the TRUNCATE in that case. A part that was interrupted
+		 * while running is rolled back by Postgres, and is copied again.
+		 */
+		if (granted)
+		{
+			CopyTableDataSpec tableSpecs = { .sourceTable = table };
+
+			if (!summary_table_count_parts_done(&(specs->catalogs.source),
+												&tableSpecs))
+			{
+				/* errors have already been logged */
+				return false;
+			}
+
+			if (tableSpecs.countPartsDone > 0)
+			{
+				log_notice("Skipping TRUNCATE of table %s: "
+						   "%u of %d parts are already done",
+						   table->qname,
+						   tableSpecs.countPartsDone,
+						   table->partition.partCount);
+
+				granted = false;
+			}
+		}
+
 		if (granted)
 		{
 			char relkind = '\0';
@@ -1352,6 +1382,31 @@ copydb_table_parts_are_all_done(CopyDataSpec *specs,
 		{
 			/* errors have already been logged */
 			return false;
+		}
+
+		/*
+		 * On --resume the row may still name the worker of the interrupted
+		 * run that first saw all the parts done. When that pid is neither
+		 * ours nor a live process, the indexes of the table might never have
+		 * been queued: reclaim the row so that this worker queues them. The
+		 * indexes that are done already are skipped by the index workers.
+		 */
+		int stalePid = tableSpecs->partsDonePid;
+
+		if (stalePid > 0 && stalePid != getpid() && kill(stalePid, 0) != 0)
+		{
+			log_notice("Found stale pid %d holding the indexes of table %s, "
+					   "reclaiming it",
+					   stalePid,
+					   tableSpecs->sourceTable->qname);
+
+			if (!summary_reclaim_table_parts_done(sourceDB, tableSpecs,
+												  stalePid) ||
+				!summary_lookup_table_parts_done(sourceDB, tableSpecs))
+			{
+				/* errors have already been logged */
+				return false;
+			}
 		}
 
 		/* set isBeingProcessed to false to allow processing indexes */

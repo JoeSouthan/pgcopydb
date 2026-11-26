@@ -380,6 +380,26 @@ vacuum_analyze_table_by_oid(CopyDataSpec *specs, uint32_t oid)
 
 	log_trace("vacuum_analyze_table_by_oid: %u %s", table.oid, table.qname);
 
+	/*
+	 * On --resume the tables are queued again when their indexes and
+	 * constraints are found done: skip those that a previous run has
+	 * vacuumed already.
+	 */
+	bool isDone = false;
+
+	if (!summary_vacuum_is_done(sourceDB, table.oid, &isDone))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (isDone)
+	{
+		log_info("Skipping VACUUM ANALYZE %s, done on a previous run",
+				 table.qname);
+		return true;
+	}
+
 	CopyTableDataSpec tableSpecs = { 0 };
 
 	/* vacuum is done per table, irrespective of the COPY partitioning */

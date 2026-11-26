@@ -30,6 +30,7 @@
 
 
 static bool catalog_upgrade_source_schema(DatabaseCatalog *catalog);
+static bool catalog_upgrade_summary_conoid(DatabaseCatalog *catalog);
 
 
 /*
@@ -329,7 +330,16 @@ static char *sourceDBcreateTableDDLs[] = {
 	"create index s_a_attisgenerated on s_attr(attisgenerated) where attisgenerated",
 	"create unique index s_i_rlname on s_index(restore_list_name)",
 	"create index s_s_rlname on s_seq(restore_list_name)",
-	"create unique index summary_extoid on summary(extoid) where extoid is not null"
+	"create unique index summary_extoid on summary(extoid) where extoid is not null",
+
+	/*
+	 * Keep a constraint summary unique per conoid so a reconnect-and-replay of
+	 * ALTER TABLE ... ADD CONSTRAINT turns its summary_add_constraint into a
+	 * no-op instead of inserting a second row: a duplicate makes the single-row
+	 * summary_lookup_constraint fail, report the constraint as not done, and let
+	 * pg_restore add the already-built constraint a second time.
+	 */
+	"create unique index summary_conoid on summary(conoid) where conoid is not null"
 };
 
 
@@ -1682,7 +1692,8 @@ catalog_init(DatabaseCatalog *catalog)
 	}
 
 	if (catalog->type == DATABASE_CATALOG_TYPE_SOURCE &&
-		!catalog_upgrade_source_schema(catalog))
+		(!catalog_upgrade_source_schema(catalog) ||
+		 !catalog_upgrade_summary_conoid(catalog)))
 	{
 		/* errors have already been logged */
 		sqlite3_close(catalog->db);
@@ -2363,6 +2374,126 @@ catalog_upgrade_source_schema(DatabaseCatalog *catalog)
 	for (int i = 0; success && lacksTables && i < count; i++)
 	{
 		success = catalog_execute(catalog, ddls[i]);
+	}
+
+	if (success)
+	{
+		success = catalog_commit(catalog);
+	}
+	else
+	{
+		(void) catalog_execute(catalog, "ROLLBACK");
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return success;
+}
+
+
+/*
+ * catalog_source_lacks_summary_conoid sets lacks when a source catalog
+ * predates the unique summary_conoid index. A catalog without a summary table
+ * is still being created, and lacks nothing.
+ */
+static bool
+catalog_source_lacks_summary_conoid(DatabaseCatalog *catalog, bool *lacks)
+{
+	char *sql =
+		"select exists(select 1 from sqlite_master "
+		"               where type = 'table' and name = 'summary') "
+		"   and not exists(select 1 from sqlite_master "
+		"                   where type = 'index' and name = 'summary_conoid')";
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(catalog->db, sql, &query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (catalog_sql_step(&query) != SQLITE_ROW)
+	{
+		log_error("Failed to check the summary indexes of \"%s\": %s",
+				  catalog->dbfile,
+				  sqlite3_errmsg(catalog->db));
+		(void) catalog_sql_finalize(&query);
+		return false;
+	}
+
+	*lacks = sqlite3_column_int(query.ppStmt, 0) == 1;
+
+	return catalog_sql_finalize(&query);
+}
+
+
+/*
+ * catalog_upgrade_summary_conoid adds the unique summary_conoid index, that
+ * summary_add_constraint relies on, to a source catalog written by an older
+ * pgcopydb. Such a catalog can have several summary rows for a constraint,
+ * left by a run that was interrupted while creating it: keep the one that is
+ * done, or else the latest one.
+ */
+static bool
+catalog_upgrade_summary_conoid(DatabaseCatalog *catalog)
+{
+	bool lacks = false;
+
+	/* the common case only reads the schema, and takes no lock */
+	if (!catalog_source_lacks_summary_conoid(catalog, &lacks))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!lacks)
+	{
+		return true;
+	}
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!catalog_begin(catalog, true))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	char *ddls[] = {
+		"delete from summary "
+		" where conoid is not null "
+		"   and rowid not in "
+		"       (select (select s2.rowid from summary s2 "
+		"                 where s2.conoid = s1.conoid "
+		"              order by s2.done_time_epoch is null, s2.rowid desc "
+		"                 limit 1) "
+		"          from summary s1 "
+		"         where s1.conoid is not null "
+		"      group by s1.conoid)",
+
+		"create unique index summary_conoid on summary(conoid) "
+		" where conoid is not null"
+	};
+
+	/* another process might have upgraded the catalog in the meantime */
+	bool success = catalog_source_lacks_summary_conoid(catalog, &lacks);
+
+	if (success && lacks)
+	{
+		log_notice("Adding index summary_conoid to \"%s\"", catalog->dbfile);
+
+		int count = sizeof(ddls) / sizeof(ddls[0]);
+
+		for (int i = 0; success && i < count; i++)
+		{
+			success = catalog_execute(catalog, ddls[i]);
+		}
 	}
 
 	if (success)
@@ -6741,7 +6872,7 @@ catalog_lookup_s_index_by_name(DatabaseCatalog *catalog,
 		"         c.oid as constraintoid, conname, "
 		"         condeferrable, condeferred, c.sql as condef"
 		"    from s_index i "
-		"         join s_table t on t.oid = i.tableoid "
+		"         left join s_table t on t.oid = i.tableoid "
 		"         left join s_constraint c on c.indexoid = i.oid"
 		"   where i.nspname = $1 and i.relname = $2 ";
 
@@ -6824,17 +6955,32 @@ catalog_s_index_fetch(SQLiteQuery *query)
 
 	index->tableOid = sqlite3_column_int64(query->ppStmt, 5);
 
-	strlcpy(index->tableQname,
-			(char *) sqlite3_column_text(query->ppStmt, 6),
-			sizeof(index->tableQname));
+	/*
+	 * The parent table columns come from a LEFT JOIN on s_table. The target
+	 * catalog lists indexes without their tables, so these are NULL there:
+	 * leave the table name fields empty rather than dereferencing NULL. The
+	 * constraint-skip guard only needs the constraint name below.
+	 */
+	if (sqlite3_column_type(query->ppStmt, 6) != SQLITE_NULL)
+	{
+		strlcpy(index->tableQname,
+				(char *) sqlite3_column_text(query->ppStmt, 6),
+				sizeof(index->tableQname));
+	}
 
-	strlcpy(index->tableNamespace,
-			(char *) sqlite3_column_text(query->ppStmt, 7),
-			sizeof(index->tableNamespace));
+	if (sqlite3_column_type(query->ppStmt, 7) != SQLITE_NULL)
+	{
+		strlcpy(index->tableNamespace,
+				(char *) sqlite3_column_text(query->ppStmt, 7),
+				sizeof(index->tableNamespace));
+	}
 
-	strlcpy(index->tableRelname,
-			(char *) sqlite3_column_text(query->ppStmt, 8),
-			sizeof(index->tableRelname));
+	if (sqlite3_column_type(query->ppStmt, 8) != SQLITE_NULL)
+	{
+		strlcpy(index->tableRelname,
+				(char *) sqlite3_column_text(query->ppStmt, 8),
+				sizeof(index->tableRelname));
+	}
 
 	index->isPrimary = sqlite3_column_int(query->ppStmt, 9) == 1;
 	index->isUnique = sqlite3_column_int(query->ppStmt, 10) == 1;
@@ -6940,7 +7086,8 @@ catalog_iter_s_index(DatabaseCatalog *catalog,
 	{
 		if (!catalog_iter_s_index_next(iter))
 		{
-			/* errors have already been logged */
+			/* finalize the statement so the catalog can be re-iterated */
+			(void) catalog_iter_s_index_finish(iter);
 			return false;
 		}
 
@@ -6962,6 +7109,9 @@ catalog_iter_s_index(DatabaseCatalog *catalog,
 		{
 			log_error("Failed to iterate over list of indexes, "
 					  "see above for details");
+
+			/* finalize the statement so the catalog can be re-iterated */
+			(void) catalog_iter_s_index_finish(iter);
 			return false;
 		}
 	}
@@ -7005,7 +7155,8 @@ catalog_iter_s_index_table(DatabaseCatalog *catalog,
 	{
 		if (!catalog_iter_s_index_next(iter))
 		{
-			/* errors have already been logged */
+			/* finalize the statement so the catalog can be re-iterated */
+			(void) catalog_iter_s_index_finish(iter);
 			(void) semaphore_unlock(&(catalog->sema));
 			return false;
 		}
@@ -7029,6 +7180,9 @@ catalog_iter_s_index_table(DatabaseCatalog *catalog,
 		{
 			log_error("Failed to iterate over list of indexes, "
 					  "see above for details");
+
+			/* finalize the statement so the catalog can be re-iterated */
+			(void) catalog_iter_s_index_finish(iter);
 			(void) semaphore_unlock(&(catalog->sema));
 			return false;
 		}
@@ -8179,7 +8333,8 @@ catalog_iter_s_seq(DatabaseCatalog *catalog,
 	{
 		if (!catalog_iter_s_seq_next(iter))
 		{
-			/* errors have already been logged */
+			/* finalize the statement so the catalog can be re-iterated */
+			(void) catalog_iter_s_seq_finish(iter);
 			return false;
 		}
 
@@ -8201,6 +8356,9 @@ catalog_iter_s_seq(DatabaseCatalog *catalog,
 		{
 			log_error("Failed to iterate over list of seqs, "
 					  "see above for details");
+
+			/* finalize the statement so the catalog can be re-iterated */
+			(void) catalog_iter_s_seq_finish(iter);
 			return false;
 		}
 	}

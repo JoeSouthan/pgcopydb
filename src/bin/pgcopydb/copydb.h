@@ -694,6 +694,10 @@ bool summary_add_table_parts_done(DatabaseCatalog *catalog,
 bool summary_lookup_table_parts_done(DatabaseCatalog *catalog,
 									 CopyTableDataSpec *tableSpecs);
 
+bool summary_reclaim_table_parts_done(DatabaseCatalog *catalog,
+									  CopyTableDataSpec *tableSpecs,
+									  int stalePid);
+
 bool summary_table_parts_done_fetch(SQLiteQuery *query);
 
 bool summary_add_vacuum(DatabaseCatalog *catalog,
@@ -701,6 +705,12 @@ bool summary_add_vacuum(DatabaseCatalog *catalog,
 
 bool summary_finish_vacuum(DatabaseCatalog *catalog,
 						   CopyTableDataSpec *tableSpecs);
+
+bool summary_vacuum_is_done(DatabaseCatalog *catalog,
+							uint32_t tableOid,
+							bool *isDone);
+
+bool summary_vacuum_is_done_fetch(SQLiteQuery *query);
 
 /*
  * Summary for Create Index and Constraints
@@ -759,6 +769,9 @@ bool summary_table_fetch_count_indexes_left(SQLiteQuery *query);
 
 bool summary_add_table_indexes_done(DatabaseCatalog *catalog,
 									CopyTableDataSpec *tableSpecs);
+
+bool summary_delete_table_indexes_done(DatabaseCatalog *catalog,
+									   CopyTableDataSpec *tableSpecs);
 
 bool summary_lookup_table_indexes_done(DatabaseCatalog *catalog,
 									   CopyTableDataSpec *tableSpecs);
